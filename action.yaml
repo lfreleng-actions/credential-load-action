@@ -2,36 +2,74 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
-# actions-template
-name: "🛠️ Actions Template"
-description: "Description of action"
-# Any relevant notes/observations can go here
+# credential-load-action
+name: '🔐 Credential Load Action'
+# yamllint disable-line rule:line-length
+description: 'Retrieves a project/repository specific credential from a 1Password vault'
 
 inputs:
-  input:
-    description: "Description of input"
+  # Mandatory
+  op_service_account_token:
+    description: '1Password service account token'
     required: true
-
-outputs:
-  output:
-    description: "Description of output"
-    value: ${{ steps.code.outputs.output }}
+  # Optional
+  vault_mapping_json:
+    description: 'JSON mapping project to vault'
+    required: false
+  credential:
+    description: 'Path to 1Password credential to retrieve'
+    required: false
 
 runs:
-  using: "composite"
+  using: 'composite'
   steps:
-    - name: "Friendly Name"
-      id: code
-      shell: bash
-      run: |
-        # Friendly Name
-        input="${{ inputs.input }}"
-        if [ -z "$input" ]; then
-          echo "Error: mandatory input was not set/configured ❌"
-          exit 1
-        fi
+    - name: 'Checkout Github repository/mirror code'
+      # yamllint disable-line rule:line-length
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-        echo "output=$input" >> "$GITHUB_ENV"
-        echo "output=$input" >> "$GITHUB_OUTPUT"
-        echo "Action received: $input ✅"
-        echo "Action received: $input ✅" >> "$GITHUB_STEP_SUMMARY"
+    - name: 'Get 1Password vault from JSON lookup table'
+      # yamllint disable-line rule:line-length
+      uses: lfreleng-actions/json-key-value-lookup-action@ed95008d49173ba450865d6c8faad0aabf07a39c # v0.1.0
+      id: vault_lookup
+      if: inputs.credential == null || inputs.credential == ''
+      with:
+        json: ${{ inputs.vault_mapping_json }}
+        key: ${{ github.repository_owner }}
+        exit_on_failure: 'true'
+        silent: 'true'
+
+    - name: 'Load secrets from 1Password'
+      id: load_secrets_default
+      if: inputs.credential == null || inputs.credential == ''
+      # yamllint disable-line rule:line-length
+      uses: 1password/load-secrets-action@13f58eec611f8e5db52ec16247f58c508398f3e6 # v3.0.0
+      env:
+        OP_SERVICE_ACCOUNT_TOKEN: ${{ inputs.op_service_account_token }}
+        # yamllint disable-line rule:line-length
+        CREDENTIAL: "op://${{ steps.vault_lookup.outputs.value }}/${{ github.event.repository.name }}/password"
+      with:
+        export-env: true
+
+    - name: 'Load secrets from 1Password'
+      id: load_secrets_explicit
+      if: inputs.credential != null && inputs.credential != ''
+      # yamllint disable-line rule:line-length
+      uses: 1password/load-secrets-action@13f58eec611f8e5db52ec16247f58c508398f3e6 # v3.0.0
+      env:
+        OP_SERVICE_ACCOUNT_TOKEN: ${{ inputs.op_service_account_token }}
+        CREDENTIAL: ${{ inputs.credential }}
+      with:
+        export-env: true
+
+    - name: 'Calculate/display SHA1SUM of 1Password credential'
+      shell: bash
+      env:
+        CREDENTIAL: ${{ env.CREDENTIAL }}
+      run: |
+        # Calculate/display SHA1SUM of 1Password credential
+        SHA1SUM_CMD=$(which sha1sum)
+        if [ ! -x "$SHA1SUM_CMD" ]; then
+          echo 'Error: sha1sum binary not found in PATH ❌'; exit 1
+        fi
+        SHA1SUM=$(echo -n "${CREDENTIAL}" | "$SHA1SUM_CMD" | awk '{print $1}')
+        echo "Credential sha1sum: $SHA1SUM" >> "$GITHUB_STEP_SUMMARY"
