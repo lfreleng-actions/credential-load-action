@@ -35,6 +35,7 @@ jobs:
           egress-policy: 'audit'
 
       - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       # Perform setup prior to running test(s)
@@ -55,19 +56,24 @@ jobs:
         shell: bash
         env:
           CREDENTIAL: ${{ env.CREDENTIAL }}
+        # yamllint disable rule:line-length
         run: |
           # We test that the credential SHA1SUM is valid
           # This is obtained using:
-          # CREDENTIAL=$(echo -n "$CREDENTIAL" | sha1sum)
-          if [ "$CREDENTIAL" == "c78aa738682ce8468b3869c035d207e3c7eb8a9f" ]; \
+          # CREDENTIAL_SHA1SUM=$(echo -n "$CREDENTIAL" | sha1sum | awk '{print $1}')
+          CREDENTIAL_SHA1SUM=$(echo -n "$CREDENTIAL" | sha1sum | awk '{print $1}')
+          if [ "$CREDENTIAL_SHA1SUM" == "c78aa738682ce8468b3869c035d207e3c7eb8a9f" ]; \
             then
               echo "Credential SHA1SUM validated ✅"
             else
               echo "Credential SHA1SUM validation failed ❌"
+              echo "Expected: c78aa738682ce8468b3869c035d207e3c7eb8a9f"
+              echo "Got: $CREDENTIAL_SHA1SUM"
+              exit 1
             fi
           echo 'Local action test passed ✅' >> "$GITHUB_STEP_SUMMARY"
+        # yamllint enable rule:line-length
 
-      # yamllint disable-line rule:line-length
       - name: 'Verify failure with bogus credential path'
         uses: ./
         id: failure
@@ -75,7 +81,6 @@ jobs:
         with:
           vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
-          # yamllint disable-line rule:line-length
           credential: "op://6n4qm2onchsinyyeuxmcfbo7ne/bogus_path/password"
 
       # Failure testing is also important
