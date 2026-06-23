@@ -42,7 +42,7 @@ runs:
       id: load_secrets_default
       if: inputs.credential == null || inputs.credential == ''
       # yamllint disable-line rule:line-length
-      uses: 1password/load-secrets-action@92467eb28f72e8255933372f1e0707c567ce2259 # v4.0.0
+      uses: 1password/load-secrets-action@3a12b0ab99d9cd590a3e9b5a90ea017210ed9556 # v4.0.1
       env:
         OP_SERVICE_ACCOUNT_TOKEN: ${{ inputs.op_service_account_token }}
         # yamllint disable-line rule:line-length
@@ -54,7 +54,7 @@ runs:
       id: load_secrets_explicit
       if: inputs.credential != null && inputs.credential != ''
       # yamllint disable-line rule:line-length
-      uses: 1password/load-secrets-action@92467eb28f72e8255933372f1e0707c567ce2259 # v4.0.0
+      uses: 1password/load-secrets-action@3a12b0ab99d9cd590a3e9b5a90ea017210ed9556 # v4.0.1
       env:
         OP_SERVICE_ACCOUNT_TOKEN: ${{ inputs.op_service_account_token }}
         CREDENTIAL: ${{ inputs.credential }}
