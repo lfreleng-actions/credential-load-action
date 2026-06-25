@@ -12,17 +12,51 @@ inputs:
   op_service_account_token:
     description: '1Password service account token'
     required: true
-  # Optional
   vault_mapping_json:
-    description: 'JSON mapping project to vault'
+    description: 'JSON mapping repository owner to 1Password vault'
+    required: true
+  # Optional
+  export_env:
+    # yamllint disable-line rule:line-length
+    description: "Export credential as CREDENTIAL env var for all later steps ('true'/'false')"
     required: false
+    default: 'false'
+
+outputs:
   credential:
-    description: 'Path to 1Password credential to retrieve'
-    required: false
+    # yamllint disable-line rule:line-length
+    description: "Loaded credential; populated only when 'export_env' is 'false'"
+    value: ${{ steps.load_secrets.outputs.CREDENTIAL }}
 
 runs:
   using: 'composite'
   steps:
+    # Refuse to run in contexts where untrusted code from a fork can execute
+    # with access to repository/organisation secrets. On pull_request_target
+    # the workflow runs in the base repository's privileged context while
+    # checking out fork-controlled code, so loading credentials here would
+    # risk exfiltration. Any pull request originating from a fork is rejected
+    # for the same reason. Fail closed before the service account token is used.
+    - name: 'Block execution in unsafe trigger contexts'
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        HEAD_REPO_FORK: ${{ github.event.pull_request.head.repo.fork }}
+      run: |
+        # Block credential loading on unsafe trigger contexts
+        if [ "${EVENT_NAME}" = "pull_request_target" ]; then
+          echo 'Error: this action must not run on pull_request_target ❌'
+          echo 'pull_request_target grants secret access to fork-controlled'
+          echo 'code; load credentials from a trusted trigger instead.'
+          exit 1
+        fi
+        if [ "${HEAD_REPO_FORK}" = "true" ]; then
+          echo 'Error: this action must not run on fork pull requests ❌'
+          echo 'Fork-originated code is untrusted and must not have access'
+          echo 'to project credentials; load them from a trusted trigger.'
+          exit 1
+        fi
+
     - name: 'Checkout GitHub repository/mirror code'
       # yamllint disable-line rule:line-length
       uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -33,47 +67,63 @@ runs:
       # yamllint disable-line rule:line-length
       uses: lfreleng-actions/json-key-value-lookup-action@ed95008d49173ba450865d6c8faad0aabf07a39c # v0.1.0
       id: vault_lookup
-      if: inputs.credential == null || inputs.credential == ''
       with:
         json: ${{ inputs.vault_mapping_json }}
         key: ${{ github.repository_owner }}
         exit_on_failure: 'true'
         silent: 'true'
 
-    - name: 'Load secrets from 1Password'
-      id: load_secrets_default
-      if: inputs.credential == null || inputs.credential == ''
-      # The op CLI is downloaded/managed internally by this action
-      # yamllint disable-line rule:line-length
-      uses: 1password/load-secrets-action@3a12b0ab99d9cd590a3e9b5a90ea017210ed9556 # v4.0.1 # zizmor: ignore[unpinned-tools]
-      env:
-        OP_SERVICE_ACCOUNT_TOKEN: ${{ inputs.op_service_account_token }}
-        # yamllint disable-line rule:line-length
-        CREDENTIAL: "op://${{ steps.vault_lookup.outputs.value }}/${{ github.event.repository.name }}/password"
-      with:
-        export-env: true
-
-    - name: 'Load secrets from 1Password'
-      id: load_secrets_explicit
-      if: inputs.credential != null && inputs.credential != ''
-      # The op CLI is downloaded/managed internally by this action
-      # yamllint disable-line rule:line-length
-      uses: 1password/load-secrets-action@3a12b0ab99d9cd590a3e9b5a90ea017210ed9556 # v4.0.1 # zizmor: ignore[unpinned-tools]
-      env:
-        OP_SERVICE_ACCOUNT_TOKEN: ${{ inputs.op_service_account_token }}
-        CREDENTIAL: ${{ inputs.credential }}
-      with:
-        export-env: true
-
-    - name: 'Calculate/display SHA1SUM of 1Password credential'
+    # The credential path is derived solely from trusted GitHub context
+    # (repository owner -> vault, repository name -> item). The calling
+    # workflow cannot influence which credential is loaded, preventing a
+    # repository from requesting credentials belonging to another project.
+    - name: 'Derive and validate repository credential path'
+      id: credential_path
       shell: bash
       env:
-        CREDENTIAL: ${{ env.CREDENTIAL }}
+        VAULT: ${{ steps.vault_lookup.outputs.value }}
+        REPOSITORY: ${{ github.event.repository.name }}
+        EXPORT_ENV: ${{ inputs.export_env }}
       run: |
-        # Calculate/display SHA1SUM of 1Password credential
-        SHA1SUM_CMD=$(which sha1sum)
-        if [ ! -x "$SHA1SUM_CMD" ]; then
-          echo 'Error: sha1sum binary not found in PATH ❌'; exit 1
+        # Validate the export_env input accepts only boolean strings
+        case "${EXPORT_ENV}" in
+          true|false) ;;
+          *)
+            echo "Error: export_env must be 'true' or 'false' ❌"
+            echo "Received value: '${EXPORT_ENV}'"
+            exit 1 ;;
+        esac
+        # Derive and validate the repository-scoped credential path
+        if [ -z "${VAULT}" ]; then
+          echo 'Error: no vault mapped for repository owner ❌'; exit 1
         fi
-        SHA1SUM=$(echo -n "${CREDENTIAL}" | "$SHA1SUM_CMD" | awk '{print $1}')
-        echo "Credential sha1sum: $SHA1SUM" >> "$GITHUB_STEP_SUMMARY"
+        if [ -z "${REPOSITORY}" ]; then
+          echo 'Error: repository name unavailable in context ❌'; exit 1
+        fi
+        # Reject any value (including embedded newlines) that could alter
+        # the op:// path structure. A case glob validates the entire string;
+        # grep would only validate per line and could be bypassed.
+        case "${VAULT}" in
+          *[!A-Za-z0-9._-]*)
+            echo 'Error: vault identifier contains invalid characters ❌'
+            echo 'Allowed characters: A-Z a-z 0-9 . _ -'
+            exit 1 ;;
+        esac
+        case "${REPOSITORY}" in
+          *[!A-Za-z0-9._-]*)
+            echo 'Error: repository name contains invalid characters ❌'
+            echo 'Allowed characters: A-Z a-z 0-9 . _ -'
+            exit 1 ;;
+        esac
+        echo "path=op://${VAULT}/${REPOSITORY}/password" >> "$GITHUB_OUTPUT"
+
+    - name: 'Load secrets from 1Password'
+      id: load_secrets
+      # The op CLI is downloaded/managed internally by this action
+      # yamllint disable-line rule:line-length
+      uses: 1password/load-secrets-action@3a12b0ab99d9cd590a3e9b5a90ea017210ed9556 # v4.0.1 # zizmor: ignore[unpinned-tools]
+      env:
+        OP_SERVICE_ACCOUNT_TOKEN: ${{ inputs.op_service_account_token }}
+        CREDENTIAL: ${{ steps.credential_path.outputs.path }}
+      with:
+        export-env: ${{ inputs.export_env }}

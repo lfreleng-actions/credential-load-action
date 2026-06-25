@@ -24,6 +24,9 @@ jobs:
   tests:
     name: 'Test local GitHub Action'
     runs-on: ubuntu-latest
+    # Gate secret access behind a dedicated environment so the 1Password
+    # service account token is only reachable from this protected context
+    environment: 'development'
     permissions:
       contents: read
     timeout-minutes: 10 # Increase this timeout value as needed
@@ -49,57 +52,93 @@ jobs:
           echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
 
       - name: "Running local action: ${{ github.repository }}"
+        id: credential-load
         uses: ./
         with:
           vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
 
-      - name: 'Check SHA1SUM of retrieved credential'
+      - name: 'Verify credential exposed via action output'
         shell: bash
         env:
-          CREDENTIAL: ${{ env.CREDENTIAL }}
-        # yamllint disable rule:line-length
+          CREDENTIAL: ${{ steps.credential-load.outputs.credential }}
         run: |
-          # We test that the credential SHA1SUM is valid
-          # This is obtained using:
-          # CREDENTIAL_SHA1SUM=$(echo -n "$CREDENTIAL" | sha1sum | awk '{print $1}')
-          CREDENTIAL_SHA1SUM=$(echo -n "$CREDENTIAL" | sha1sum | awk '{print $1}')
-          if [ "$CREDENTIAL_SHA1SUM" == "c78aa738682ce8468b3869c035d207e3c7eb8a9f" ]; \
-            then
-              echo "Credential SHA1SUM validated ✅"
-            else
-              echo "Credential SHA1SUM validation failed ❌"
-              echo "Expected: c78aa738682ce8468b3869c035d207e3c7eb8a9f"
-              echo "Got: $CREDENTIAL_SHA1SUM"
-              exit 1
-            fi
-          echo 'Local action test passed ✅' >> "$GITHUB_STEP_SUMMARY"
-        # yamllint enable rule:line-length
-
-      - name: 'Verify failure with bogus credential path'
-        uses: ./
-        id: failure
-        continue-on-error: true
-        with:
-          vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
-          op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
-          credential: "op://6n4qm2onchsinyyeuxmcfbo7ne/bogus_path/password"
-
-      # Failure testing is also important
-      - name: 'Validate above failure'
-        shell: bash
-        env:
-          FAILURE_OUTCOME: ${{ steps.failure.outcome }}
-        run: |
-          # Check if step above failed as expected
-          if [ "$FAILURE_OUTCOME" == "success" ]; then
-            # Error if step above did NOT fail
-            echo 'Test expected to fail did NOT fail ❌'
-            echo 'Test expected to fail did NOT fail ❌' \
+          # Confirm the credential output is populated (default export_env)
+          # and matches the known test credential. The expected hash is a
+          # fixed constant; the computed hash is never printed.
+          if [ -z "${CREDENTIAL}" ]; then
+            echo 'Credential not exposed via action output ❌'
+            echo 'Credential not exposed via action output ❌' \
               >> "$GITHUB_STEP_SUMMARY"
             exit 1
-          else
-            # Success if step above failed as expected
-            echo "Failure testing passed ✅"
-            echo "Failure testing passed ✅" >> "$GITHUB_STEP_SUMMARY"
           fi
+          EXPECTED='c78aa738682ce8468b3869c035d207e3c7eb8a9f'
+          ACTUAL=$(printf '%s' "${CREDENTIAL}" | sha1sum | awk '{print $1}')
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo 'Credential output did not match expected test value ❌'
+            echo 'Credential output did not match expected test value ❌' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo 'Output mode test passed ✅' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 'Confirm credential not leaked into environment'
+        shell: bash
+        run: |
+          # In default mode the action must not export to $GITHUB_ENV, so the
+          # inherited CREDENTIAL is read directly and must be empty/unset
+          if [ -n "${CREDENTIAL:-}" ]; then
+            echo 'Credential unexpectedly present in environment ❌'
+            echo 'Credential unexpectedly present in environment ❌' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo 'Environment isolation test passed ✅' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 'Running local action with export_env enabled'
+        id: credential-load-env
+        uses: ./
+        with:
+          vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+          op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          export_env: 'true'
+
+      - name: 'Confirm output empty when exporting to environment'
+        shell: bash
+        env:
+          OUTPUT_CREDENTIAL: ${{ steps.credential-load-env.outputs.credential }}
+        run: |
+          # With export_env enabled the secret must travel via the environment
+          # only; the action output must stay empty to avoid dual exposure
+          if [ -n "${OUTPUT_CREDENTIAL}" ]; then
+            echo 'Credential unexpectedly exposed via output ❌'
+            echo 'Credential unexpectedly exposed via output ❌' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo 'Output suppression test passed ✅' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 'Verify credential loaded into environment'
+        shell: bash
+        run: |
+          # The action exported the credential to $GITHUB_ENV, so it is read
+          # directly from the inherited environment and compared to the known
+          # test value. The computed hash is never printed.
+          cred="${CREDENTIAL:-}"
+          if [ -z "${cred}" ]; then
+            echo 'Credential not loaded into environment ❌'
+            echo 'Credential not loaded into environment ❌' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          EXPECTED='c78aa738682ce8468b3869c035d207e3c7eb8a9f'
+          ACTUAL=$(printf '%s' "${cred}" | sha1sum | awk '{print $1}')
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo 'Env credential did not match expected test value ❌'
+            echo 'Env credential did not match expected test value ❌' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo 'Environment export test passed ✅' >> "$GITHUB_STEP_SUMMARY"
