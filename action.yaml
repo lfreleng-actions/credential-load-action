@@ -65,7 +65,7 @@ runs:
 
     - name: 'Get 1Password vault from JSON lookup table'
       # yamllint disable-line rule:line-length
-      uses: lfreleng-actions/json-key-value-lookup-action@ed95008d49173ba450865d6c8faad0aabf07a39c # v0.1.0
+      uses: lfreleng-actions/json-key-value-lookup-action@6622b1017699e557a76c8d041cfb7378160424c9 # v0.1.2
       id: vault_lookup
       with:
         json: ${{ inputs.vault_mapping_json }}
