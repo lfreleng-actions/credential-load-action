@@ -13,9 +13,20 @@ inputs:
     description: '1Password service account token'
     required: true
   vault_mapping_json:
-    description: 'JSON mapping repository owner to 1Password vault'
+    # yamllint disable-line rule:line-length
+    description: 'JSON mapping repository owner to 1Password vault; accepts the JSON base64 encoded (preferred, avoids degraded log redaction) or as plain JSON'
     required: true
   # Optional
+  credential_name:
+    # yamllint disable-line rule:line-length
+    description: "Explicit 1Password item name; overrides the derived repository name (e.g. Gerrit project 'sdc/onap-ui-common' stored as 'sdc-onap-ui-common'). Overrides naming a different item than the repository's own name require a matching grant in credential_grants_json"
+    required: false
+    default: ''
+  credential_grants_json:
+    # yamllint disable-line rule:line-length
+    description: "JSON array of credential item names this repository may load via credential_name (e.g. '[\"sdc-onap-ui-common\"]'). Wire this from the administrator-controlled CREDENTIAL_LOAD_GRANTS repository variable; project teams without repository administration rights cannot set it themselves"
+    required: false
+    default: ''
   export_env:
     # yamllint disable-line rule:line-length
     description: "Export credential as CREDENTIAL env var for all later steps ('true'/'false')"
@@ -63,26 +74,113 @@ runs:
       with:
         persist-credentials: false
 
+    # The vault mapping typically lives in a GitHub secret. Raw JSON in
+    # secrets degrades log redaction: JSON structural characters cause
+    # the masking engine to mis-fire, rendering console logs illegible.
+    # Administrators should therefore store the mapping base64 encoded;
+    # this step transparently accepts either form, preferring base64,
+    # so encoded and plain secrets can coexist during migration.
+    - name: 'Normalise vault mapping JSON'
+      id: vault_json
+      shell: bash
+      env:
+        RAW_MAPPING: ${{ inputs.vault_mapping_json }}
+      run: |
+        # Accept base64 encoded or plain JSON vault mappings
+        # Preflight: fail with a clear message when required tools are
+        # missing (possible on minimal self-hosted runners)
+        for tool in jq openssl; do
+          if ! command -v "${tool}" > /dev/null 2>&1; then
+            echo "Error: required tool not found: ${tool} ❌"
+            echo 'This action requires jq and openssl on the runner'
+            exit 1
+          fi
+        done
+        if [ -z "${RAW_MAPPING}" ]; then
+          echo 'Error: vault_mapping_json is empty ❌'
+          exit 1
+        fi
+        # The mapping must be a JSON array of {key, value} string pairs;
+        # anything else fails closed before the vault lookup runs
+        validate_mapping() {
+          printf '%s' "$1" | jq -e '
+            type == "array" and
+            all(.[]; type == "object"
+              and (.key | type == "string")
+              and (.value | type == "string"))' > /dev/null 2>&1
+        }
+        # Require a successful decoder exit status; partial output from
+        # malformed/truncated base64 input never gets accepted. The
+        # openssl decoder behaves identically across GNU and BSD hosts
+        # (unlike base64 -d/-D)
+        if ! decoded=$(printf '%s' "${RAW_MAPPING}" \
+          | tr -d '[:space:]' | openssl base64 -d -A 2>/dev/null); then
+          decoded=''
+        fi
+        if [ -n "${decoded}" ] && validate_mapping "${decoded}"; then
+          mapping="${decoded}"
+          echo 'Vault mapping decoded from base64 ✅'
+        elif validate_mapping "${RAW_MAPPING}"; then
+          mapping="${RAW_MAPPING}"
+          echo 'Vault mapping accepted as plain JSON'
+          echo '::notice::credential-load-action: consider base64' \
+            'encoding the vault mapping secret; raw JSON in secrets' \
+            'degrades workflow log redaction'
+        else
+          echo 'Error: invalid vault_mapping_json ❌'
+          echo 'The value is neither base64 encoded JSON nor plain'
+          echo 'JSON (expected a JSON array of objects, each with'
+          echo 'string "key" and "value" fields)'
+          exit 1
+        fi
+        # Mask each vault identifier so values never appear in logs,
+        # regardless of the input encoding. Strip CR/LF and emit via
+        # printf so a malformed value can never break out of, or
+        # inject, workflow commands
+        printf '%s' "${mapping}" | jq -r '.[].value' \
+          | while IFS= read -r vault_id; do
+          vault_id=$(printf '%s' "${vault_id}" | tr -d '\r\n')
+          if [ -n "${vault_id}" ]; then
+            printf '%s\n' "::add-mask::${vault_id}"
+          fi
+        done
+        # Emit via random heredoc delimiter to prevent output injection
+        delimiter="$(openssl rand -hex 16)"
+        {
+          echo "json<<${delimiter}"
+          printf '%s\n' "${mapping}"
+          echo "${delimiter}"
+        } >> "$GITHUB_OUTPUT"
+
     - name: 'Get 1Password vault from JSON lookup table'
       # yamllint disable-line rule:line-length
       uses: lfreleng-actions/json-key-value-lookup-action@6622b1017699e557a76c8d041cfb7378160424c9 # v0.1.2
       id: vault_lookup
       with:
-        json: ${{ inputs.vault_mapping_json }}
+        json: ${{ steps.vault_json.outputs.json }}
         key: ${{ github.repository_owner }}
         exit_on_failure: 'true'
         silent: 'true'
 
-    # The credential path is derived solely from trusted GitHub context
-    # (repository owner -> vault, repository name -> item). The calling
-    # workflow cannot influence which credential is loaded, preventing a
-    # repository from requesting credentials belonging to another project.
+    # The credential path is derived from trusted GitHub context by default
+    # (repository owner -> vault, repository name -> item). The vault always
+    # comes from the owner mapping, so a repository can only reach items in
+    # its own organisation's vault. The optional credential_name input lets
+    # Gerrit-mirrored repositories select a differently named item within
+    # that same vault when the mirror name differs from the credential name.
+    # Overrides naming anything other than the repository's own derived
+    # name additionally require a matching entry in the
+    # credential_grants_json allowlist, which administrators manage via
+    # the CREDENTIAL_LOAD_GRANTS repository variable. Every active
+    # override emits an audit notice in the run log and step summary.
     - name: 'Derive and validate repository credential path'
       id: credential_path
       shell: bash
       env:
         VAULT: ${{ steps.vault_lookup.outputs.value }}
         REPOSITORY: ${{ github.event.repository.name }}
+        CREDENTIAL_NAME: ${{ inputs.credential_name }}
+        CREDENTIAL_GRANTS: ${{ inputs.credential_grants_json }}
         EXPORT_ENV: ${{ inputs.export_env }}
       run: |
         # Validate the export_env input accepts only boolean strings
@@ -93,12 +191,83 @@ runs:
             echo "Received value: '${EXPORT_ENV}'"
             exit 1 ;;
         esac
+        # Validate credential_name against the allowed character set
+        # BEFORE printing it or using it in notices, so a malicious
+        # value can never inject workflow commands or annotations. A
+        # case glob validates the entire string, including embedded
+        # newlines; grep would only validate per line
+        if [ -n "${CREDENTIAL_NAME}" ]; then
+          case "${CREDENTIAL_NAME}" in
+            *[!A-Za-z0-9._-]*)
+              echo 'Error: invalid credential_name ❌'
+              echo 'Allowed characters: A-Z a-z 0-9 . _ -'
+              exit 1 ;;
+          esac
+        fi
         # Derive and validate the repository-scoped credential path
         if [ -z "${VAULT}" ]; then
           echo 'Error: no vault mapped for repository owner ❌'; exit 1
         fi
-        if [ -z "${REPOSITORY}" ]; then
-          echo 'Error: repository name unavailable in context ❌'; exit 1
+        # Resolve the repository's own derived name, in priority order:
+        # 1. github.event.repository.name (absent for some triggers,
+        #    for example workflow_call)
+        # 2. the repository portion of the built-in GITHUB_REPOSITORY
+        #    (owner/repo), which is populated for every event
+        own_name="${REPOSITORY}"
+        if [ -z "${own_name}" ]; then
+          own_name="${GITHUB_REPOSITORY##*/}"
+        fi
+        item=''
+        if [ -n "${CREDENTIAL_NAME}" ]; then
+          if [ "${CREDENTIAL_NAME}" = "${own_name}" ]; then
+            # Explicitly pinning the repository's own credential name
+            # needs no grant; it matches the default derivation
+            item="${CREDENTIAL_NAME}"
+          else
+            # Loading a different item requires an explicit grant from
+            # the administrator-controlled allowlist
+            if [ -z "${CREDENTIAL_GRANTS}" ]; then
+              echo 'Error: credential_name override not granted ❌'
+              echo "Requested item: ${CREDENTIAL_NAME}"
+              echo 'No credential_grants_json allowlist provided.'
+              echo 'Repository administrators can grant access by'
+              echo 'setting the CREDENTIAL_LOAD_GRANTS repository'
+              echo 'variable to a JSON array of permitted credential'
+              echo 'item names'
+              exit 1
+            fi
+            if ! printf '%s' "${CREDENTIAL_GRANTS}" \
+              | jq -e 'type == "array" and all(.[]; type == "string")' \
+              > /dev/null 2>&1; then
+              echo 'Error: invalid credential_grants_json ❌'
+              echo 'The allowlist must be a JSON array of strings'
+              exit 1
+            fi
+            if ! printf '%s' "${CREDENTIAL_GRANTS}" \
+              | jq -e --arg name "${CREDENTIAL_NAME}" \
+              'index($name) != null' > /dev/null 2>&1; then
+              echo 'Error: credential_name override not granted ❌'
+              echo "Requested item: ${CREDENTIAL_NAME}"
+              echo 'The allowlist does not include this item name'
+              exit 1
+            fi
+            item="${CREDENTIAL_NAME}"
+            # Audit trail: overrides are always visible in the run log
+            # and step summary
+            echo "::notice::credential-load-action override active:" \
+              "loading item '${item}' (granted via allowlist)"
+            echo "Credential override active: ${item} 🔓" \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+        else
+          item="${own_name}"
+        fi
+        if [ -z "${item}" ]; then
+          echo 'Error: could not resolve credential item name ❌'
+          echo 'No credential_name input set, and neither the event'
+          echo 'repository name nor GITHUB_REPOSITORY are available'
+          echo 'in this execution context'
+          exit 1
         fi
         # Reject any value (including embedded newlines) that could alter
         # the op:// path structure. A case glob validates the entire string;
@@ -109,13 +278,13 @@ runs:
             echo 'Allowed characters: A-Z a-z 0-9 . _ -'
             exit 1 ;;
         esac
-        case "${REPOSITORY}" in
+        case "${item}" in
           *[!A-Za-z0-9._-]*)
-            echo 'Error: repository name contains invalid characters ❌'
+            echo 'Error: credential item name contains invalid characters ❌'
             echo 'Allowed characters: A-Z a-z 0-9 . _ -'
             exit 1 ;;
         esac
-        echo "path=op://${VAULT}/${REPOSITORY}/password" >> "$GITHUB_OUTPUT"
+        echo "path=op://${VAULT}/${item}/password" >> "$GITHUB_OUTPUT"
 
     - name: 'Load secrets from 1Password'
       id: load_secrets
