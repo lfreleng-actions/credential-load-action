@@ -142,3 +142,194 @@ jobs:
             exit 1
           fi
           echo 'Environment export test passed ✅' >> "$GITHUB_STEP_SUMMARY"
+
+      # Exercise the explicit credential_name override path. Passing the
+      # repository's own name resolves the same 1Password item, so the
+      # override is verified against the same known test credential.
+      - name: 'Derive repository name for override test'
+        id: repo-name
+        shell: bash
+        run: |
+          # Derive the repository name from GITHUB_REPOSITORY (owner/repo)
+          echo "name=${GITHUB_REPOSITORY##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: 'Running local action with credential_name override'
+        id: credential-load-named
+        uses: ./
+        with:
+          vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+          op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          credential_name: ${{ steps.repo-name.outputs.name }}
+
+      - name: 'Verify credential loaded via credential_name override'
+        shell: bash
+        env:
+          OVERRIDE_CREDENTIAL: >-
+            ${{ steps.credential-load-named.outputs.credential }}
+        run: |
+          # The override names the repository's own item, so the loaded
+          # credential must match the known test value. The expected hash
+          # is a fixed constant; the computed hash is never printed.
+          if [ -z "${OVERRIDE_CREDENTIAL}" ]; then
+            echo 'Credential not loaded via credential_name override ❌'
+            echo 'Credential not loaded via credential_name override ❌' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          EXPECTED='c78aa738682ce8468b3869c035d207e3c7eb8a9f'
+          ACTUAL=$(printf '%s' "${OVERRIDE_CREDENTIAL}" | sha1sum \
+            | awk '{print $1}')
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo 'Override credential did not match expected value ❌'
+            echo 'Override credential did not match expected value ❌' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo 'credential_name override test passed ✅' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # An override naming a DIFFERENT item than the repository's own
+      # name must be rejected when no grants allowlist is provided.
+      # This fails during path derivation, before any 1Password call.
+      - name: 'Running local action with ungranted override'
+        id: ungranted-override
+        continue-on-error: true
+        uses: ./
+        with:
+          vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+          op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          credential_name: 'some-other-repository'
+
+      - name: 'Verify ungranted override was rejected'
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.ungranted-override.outcome }}
+        run: |
+          # Failure testing is also important; the previous step MUST fail
+          if [ "${OUTCOME}" = 'success' ]; then
+            echo 'Ungranted override unexpectedly succeeded ❌'
+            echo 'Ungranted override unexpectedly succeeded ❌' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo 'Ungranted override rejection test passed ✅' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # An override absent from a provided grants allowlist must also
+      # be rejected, and malformed allowlists must fail closed
+      - name: 'Running local action with non-matching grant'
+        id: nonmatching-grant
+        continue-on-error: true
+        uses: ./
+        with:
+          vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+          op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          credential_name: 'some-other-repository'
+          credential_grants_json: '["a-different-grant"]'
+
+      - name: 'Running local action with malformed grants JSON'
+        id: malformed-grants
+        continue-on-error: true
+        uses: ./
+        with:
+          vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+          op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          credential_name: 'some-other-repository'
+          credential_grants_json: 'not-json'
+
+      - name: 'Verify grant mismatch and malformed grants rejected'
+        shell: bash
+        env:
+          MISMATCH_OUTCOME: ${{ steps.nonmatching-grant.outcome }}
+          MALFORMED_OUTCOME: ${{ steps.malformed-grants.outcome }}
+        run: |
+          # Failure testing is also important; both steps MUST fail
+          if [ "${MISMATCH_OUTCOME}" = 'success' ]; then
+            echo 'Non-matching grant unexpectedly succeeded ❌'
+            echo 'Non-matching grant unexpectedly succeeded ❌' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [ "${MALFORMED_OUTCOME}" = 'success' ]; then
+            echo 'Malformed grants JSON unexpectedly succeeded ❌'
+            echo 'Malformed grants JSON unexpectedly succeeded ❌' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo 'Grants enforcement tests passed ✅' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # The action accepts the vault mapping base64 encoded (preferred,
+      # preserves log redaction). Encode the existing plain JSON secret
+      # at runtime so the encoded test exercises identical content, and
+      # mask the encoded form so neither representation leaks into logs
+      - name: 'Encode vault mapping secret as base64'
+        id: encode-mapping
+        shell: bash
+        env:
+          VAULT_MAPPING: ${{ secrets.VAULT_MAPPING_JSON }}
+        run: |
+          # Base64 encode the vault mapping for the encoded input test
+          encoded=$(printf '%s' "${VAULT_MAPPING}" | base64 -w0)
+          echo "::add-mask::${encoded}"
+          delimiter="$(openssl rand -hex 16)"
+          {
+            echo "encoded<<${delimiter}"
+            printf '%s\n' "${encoded}"
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 'Running local action with base64 encoded mapping'
+        id: base64-mapping
+        uses: ./
+        with:
+          vault_mapping_json: ${{ steps.encode-mapping.outputs.encoded }}
+          op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+      - name: 'Verify base64 encoded mapping loaded credential'
+        shell: bash
+        env:
+          CREDENTIAL: ${{ steps.base64-mapping.outputs.credential }}
+        run: |
+          # The encoded mapping must resolve the same test credential
+          if [ -z "${CREDENTIAL}" ]; then
+            echo 'Base64 mapping did not expose credential output ❌'
+            echo 'Base64 mapping did not expose credential output ❌' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          EXPECTED='c78aa738682ce8468b3869c035d207e3c7eb8a9f'
+          ACTUAL=$(printf '%s' "${CREDENTIAL}" | sha1sum | awk '{print $1}')
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo 'Base64 mapping credential mismatch ❌'
+            echo 'Base64 mapping credential mismatch ❌' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo 'Base64 encoded mapping test passed ✅' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # A mapping that is neither base64 encoded JSON nor plain JSON
+      # must fail during normalisation, before any 1Password call
+      - name: 'Running local action with malformed vault mapping'
+        id: malformed-mapping
+        continue-on-error: true
+        uses: ./
+        with:
+          vault_mapping_json: 'neither-base64-nor-json!'
+          op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+      - name: 'Verify malformed vault mapping was rejected'
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.malformed-mapping.outcome }}
+        run: |
+          # Failure testing is also important; the previous step MUST fail
+          if [ "${OUTCOME}" = 'success' ]; then
+            echo 'Malformed vault mapping unexpectedly succeeded ❌'
+            echo 'Malformed vault mapping unexpectedly succeeded ❌' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo 'Malformed vault mapping rejection test passed ✅' \
+            >> "$GITHUB_STEP_SUMMARY"
