@@ -32,6 +32,11 @@ inputs:
     description: "Export credential as CREDENTIAL env var for all later steps ('true'/'false')"
     required: false
     default: 'false'
+  checkout:
+    # yamllint disable-line rule:line-length
+    description: "Check out the repository as part of this action ('true'/'false'). The action needs no repository files itself, so the checkout is off by default; it resets and cleans the workspace, discarding untracked files and any non-default checkout (e.g. a Gerrit change or downloaded artefacts). Set 'true' only when a later step needs the default branch checked out and the job performs no checkout of its own"
+    required: false
+    default: 'false'
 
 outputs:
   credential:
@@ -53,8 +58,19 @@ runs:
       env:
         EVENT_NAME: ${{ github.event_name }}
         HEAD_REPO_FORK: ${{ github.event.pull_request.head.repo.fork }}
+        CHECKOUT: ${{ inputs.checkout }}
       run: |
         # Block credential loading on unsafe trigger contexts
+        # Validate the checkout input up front: a step-level 'if'
+        # comparison silently skips on typos, so an invalid value
+        # must fail loudly here instead of changing behaviour
+        case "${CHECKOUT}" in
+          true|false) ;;
+          *)
+            echo "Error: checkout must be 'true' or 'false' ❌"
+            echo "Received value: '${CHECKOUT}'"
+            exit 1 ;;
+        esac
         if [ "${EVENT_NAME}" = "pull_request_target" ]; then
           echo 'Error: this action must not run on pull_request_target ❌'
           echo 'pull_request_target grants secret access to fork-controlled'
@@ -68,7 +84,15 @@ runs:
           exit 1
         fi
 
+    # Optional and off by default: the action needs no repository
+    # files itself, and a checkout here resets/cleans the working
+    # tree (discarding untracked files) and re-clones the default
+    # GitHub context over any non-default checkout (e.g. a Gerrit
+    # change or downloaded artefacts). Callers whose later steps need
+    # the default branch present, and which perform no checkout of
+    # their own, can opt back in with checkout: 'true'.
     - name: 'Checkout GitHub repository/mirror code'
+      if: inputs.checkout == 'true'
       # yamllint disable-line rule:line-length
       uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
