@@ -60,6 +60,7 @@ steps:
 | credential_name          | False    | ''      | Explicit 1Password item name; overrides the derived repository name (grant required when it differs from the repository's own name) |
 | credential_grants_json   | False    | ''      | JSON array of item names this repository may load via `credential_name`; wire from the `CREDENTIAL_LOAD_GRANTS` repository variable |
 | export_env               | False    | false   | Export credential as the `CREDENTIAL` environment variable for all later steps                                                      |
+| checkout                 | False    | false   | Check out the repository as part of this action; opt in with `true` when a later step needs the default branch checked out          |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -280,7 +281,7 @@ environment as `CREDENTIAL` and the `credential` output is empty.
 <!-- markdownlint-disable MD013 -->
 
 1. **Trigger Guard**: Refuses to run on `pull_request_target` or fork pull requests before using the service account token
-2. **Checkout**: Checks out the repository with `persist-credentials: false`
+2. **Checkout**: Optionally checks out the repository with `persist-credentials: false` (requires `checkout: 'true'`; skipped by default)
 3. **Mapping Normalisation**: Decodes the vault mapping from base64 (falling back to plain JSON), validates it, and masks each vault identifier
 4. **Vault Lookup**: Uses the repository owner as a key to look up the vault from the JSON mapping
 5. **Path Derivation**: Builds and validates a repository-scoped `op://` path from trusted GitHub context, with `credential_name` as an optional item-name override (grant-gated when it names a different item) and `GITHUB_REPOSITORY` as a fallback when `github.event.repository.name` is absent
@@ -291,3 +292,10 @@ environment as `CREDENTIAL` and the `credential` output is empty.
 - The action loads credentials using the pattern: `op://{vault}/{item-name}/password`, where the item name defaults to the repository name
 - The vault mapping JSON should map repository owner names to their corresponding 1Password vaults; store it base64 encoded to preserve log redaction
 - By default the action exposes the credential via the `credential` output; set `export_env: 'true'` to use the `CREDENTIAL` environment variable instead
+- The action needs no repository files itself, so it performs no checkout
+  by default: a checkout resets and cleans the working tree, discarding
+  untracked files (such as build output) and replacing any non-default
+  checkout (such as a Gerrit change, or artefacts downloaded from earlier
+  jobs) with the default GitHub context. Set `checkout: 'true'` when a
+  later step needs the default branch present and the job performs no
+  checkout of its own (versions before v2 checked out unconditionally)
