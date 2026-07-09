@@ -312,11 +312,13 @@ runs:
 
     - name: 'Load secrets from 1Password'
       id: load_secrets
-      # The op CLI is downloaded/managed internally by this action
+      # The op CLI is downloaded/managed internally by this action; pin the
+      # tool version explicitly so it is not fetched as an unpinned 'latest'.
       # yamllint disable-line rule:line-length
-      uses: 1password/load-secrets-action@3a12b0ab99d9cd590a3e9b5a90ea017210ed9556 # v4.0.1 # zizmor: ignore[unpinned-tools]
+      uses: 1password/load-secrets-action@3a12b0ab99d9cd590a3e9b5a90ea017210ed9556 # v4.0.1
       env:
         OP_SERVICE_ACCOUNT_TOKEN: ${{ inputs.op_service_account_token }}
         CREDENTIAL: ${{ steps.credential_path.outputs.path }}
       with:
         export-env: ${{ inputs.export_env }}
+        version: '2.34.1'
