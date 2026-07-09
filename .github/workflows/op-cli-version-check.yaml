@@ -1,0 +1,207 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Weekly 1Password CLI version reminder.
+#
+# The 1Password `op` CLI version consumed by this action is pinned in
+# action.yaml (via the load-secrets-action `version` input) so that
+# zizmor's auditor persona does not flag it as an unpinned tool. Because
+# the version is pinned it no longer updates on its own, so this workflow
+# compares the pinned value against the latest stable release every
+# Tuesday morning and posts a Slack reminder when a newer version exists.
+#
+# Slack delivery is optional: it only fires when the SLACK_BOT_TOKEN
+# secret and SLACK_CHANNEL_ID variable are configured. The step summary
+# and a workflow warning always surface the result.
+#
+# A manual run (workflow_dispatch) accepts a 'test_notification' input
+# that forces a clearly-labelled test message even when the pinned
+# version is already current, so the Slack wiring can be validated on
+# demand.
+#
+# The job is bound to a dedicated 'notifications' environment so the
+# Slack bot token is only reachable from this context (satisfying
+# zizmor's secrets-outside-env audit). Ensure SLACK_BOT_TOKEN and
+# SLACK_CHANNEL_ID are reachable there; repository-level secrets and
+# variables are inherited automatically. Keep the environment free of
+# required-reviewer rules so scheduled runs are not blocked.
+name: '1Password CLI Version Check 🔔'
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_dispatch:
+    inputs:
+      test_notification:
+        description: 'Force a test Slack notification to verify wiring'
+        type: boolean
+        default: false
+  schedule:
+    # 08:00 UTC every Tuesday
+    - cron: '0 8 * * 2'
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.ref }}'
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  check-op-cli-version:
+    name: 'Check pinned op CLI version'
+    runs-on: ubuntu-latest
+    # Gate Slack secret access behind a dedicated environment
+    environment: 'notifications'
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      # Harden the runner used by this workflow
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: 'Compare pinned op CLI version against latest stable'
+        id: compare
+        shell: bash
+        env:
+          # Same endpoint the load-secrets-action uses to resolve 'latest'
+          LATEST_URL: 'https://app-updates.agilebits.com/latest'
+          # Manual override that forces a labelled test notification
+          TEST_NOTIFY: '${{ inputs.test_notification }}'
+        run: |
+          set -euo pipefail
+          # Extract the version pinned in action.yaml (single-quoted
+          # semver passed to the load-secrets-action 'version' input).
+          pinned="$(grep -oE "version: '[0-9]+\.[0-9]+\.[0-9]+'" \
+            action.yaml | head -n1 \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+          if [ -z "${pinned}" ]; then
+            msg='Could not read pinned op CLI version from action.yaml'
+            echo "::warning::${msg}"
+            echo 'notify=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Resolve the latest stable CLI2 release.
+          latest="$(curl -fsSL --retry 3 "${LATEST_URL}" \
+            | jq -r '.CLI2.release.version')"
+          if [ -z "${latest}" ] || [ "${latest}" = 'null' ]; then
+            echo '::error::Could not determine latest op CLI version'
+            exit 1
+          fi
+          # A newer release exists only when 'latest' sorts above the
+          # pinned value and differs from it (version-aware comparison).
+          highest="$(printf '%s\n%s\n' "${pinned}" "${latest}" \
+            | sort -V | tail -n1)"
+          outdated=false
+          if [ "${pinned}" != "${latest}" ] \
+            && [ "${highest}" = "${latest}" ]; then
+            outdated=true
+          fi
+          # A manual dispatch may force a notification to test wiring
+          # even when the pinned version is already current.
+          notify=false
+          mode=real
+          if [ "${outdated}" = 'true' ]; then
+            notify=true
+          elif [ "${TEST_NOTIFY:-false}" = 'true' ]; then
+            notify=true
+            mode=manual
+          fi
+          if [ "${mode}" = 'manual' ]; then
+            headline='🧪 1Password CLI reminder (test)'
+            detail='Slack wiring test — pinned version is current.'
+          else
+            headline='🔔 1Password CLI update available'
+            detail="Bump the \`version:\` input in \`action.yaml\`."
+          fi
+          {
+            echo "pinned=${pinned}"
+            echo "latest=${latest}"
+            echo "notify=${notify}"
+            echo "headline=${headline}"
+            echo "detail=${detail}"
+          } >> "$GITHUB_OUTPUT"
+          # Always surface the outcome in the job summary.
+          if [ "${outdated}" = 'true' ]; then
+            echo "::warning::Newer op CLI ${latest} (pinned ${pinned})"
+            {
+              echo '## 1Password CLI update available 🔔'
+              echo ''
+              echo "- Pinned: \`${pinned}\`"
+              echo "- Latest stable: \`${latest}\`"
+              echo ''
+              echo "Bump the \`version:\` input in \`action.yaml\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${mode}" = 'manual' ]; then
+            {
+              echo '## 1Password CLI reminder test 🧪'
+              echo ''
+              echo "- Pinned: \`${pinned}\`"
+              echo "- Latest stable: \`${latest}\`"
+              echo ''
+              echo 'Forced test notification; pin is already current.'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Pinned op CLI ${pinned} is current (latest ${latest})" \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 'Check Slack configuration'
+        id: check-slack-config
+        if: steps.compare.outputs.notify == 'true'
+        shell: bash
+        env:
+          SLACK_BOT_TOKEN: '${{ secrets.SLACK_BOT_TOKEN }}'
+        run: |
+          if [ -n "${SLACK_BOT_TOKEN}" ]; then
+            echo 'configured=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'configured=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 'Send Slack update reminder'
+        if: >-
+          steps.compare.outputs.notify == 'true'
+          && steps.check-slack-config.outputs.configured == 'true'
+          && vars.SLACK_CHANNEL_ID != ''
+        # yamllint disable-line rule:line-length
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: 'chat.postMessage'
+          token: '${{ secrets.SLACK_BOT_TOKEN }}'
+          # yamllint disable rule:line-length
+          payload: |
+            channel: "${{ vars.SLACK_CHANNEL_ID }}"
+            text: "${{ steps.compare.outputs.headline }} — ${{ github.repository }}"
+            blocks:
+              - type: "header"
+                text:
+                  type: "plain_text"
+                  text: "${{ steps.compare.outputs.headline }}"
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "*Repository:* <${{ github.server_url }}/${{ github.repository }}|${{ github.repository }}>"
+              - type: "section"
+                fields:
+                  - type: "mrkdwn"
+                    text: "*Pinned:* `${{ steps.compare.outputs.pinned }}`"
+                  - type: "mrkdwn"
+                    text: "*Latest stable:* `${{ steps.compare.outputs.latest }}`"
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "${{ steps.compare.outputs.detail }}"
+              - type: "context"
+                elements:
+                  - type: "mrkdwn"
+                    text: "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View workflow run>"
+          # yamllint enable rule:line-length
