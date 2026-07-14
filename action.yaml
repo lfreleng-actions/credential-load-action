@@ -321,4 +321,4 @@ runs:
         CREDENTIAL: ${{ steps.credential_path.outputs.path }}
       with:
         export-env: ${{ inputs.export_env }}
-        version: '2.34.1'
+        version: '2.35.0'
