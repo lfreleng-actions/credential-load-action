@@ -37,12 +37,6 @@ jobs:
         with:
           egress-policy: 'audit'
 
-      - name: 'Checkout repository'
-        # yamllint disable-line rule:line-length
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
       # Perform setup prior to running test(s)
       - name: 'Testing setup step'
         shell: bash
@@ -53,7 +47,7 @@ jobs:
 
       - name: "Running local action: ${{ github.repository }}"
         id: credential-load
-        uses: ./
+        uses: $/
         with:
           vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
@@ -98,7 +92,7 @@ jobs:
 
       - name: 'Running local action with export_env enabled'
         id: credential-load-env
-        uses: ./
+        uses: $/
         with:
           vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
@@ -155,7 +149,7 @@ jobs:
 
       - name: 'Running local action with credential_name override'
         id: credential-load-named
-        uses: ./
+        uses: $/
         with:
           vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
@@ -194,7 +188,7 @@ jobs:
       - name: 'Running local action with ungranted override'
         id: ungranted-override
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
@@ -220,7 +214,7 @@ jobs:
       - name: 'Running local action with non-matching grant'
         id: nonmatching-grant
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
@@ -230,7 +224,7 @@ jobs:
       - name: 'Running local action with malformed grants JSON'
         id: malformed-grants
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
@@ -283,7 +277,7 @@ jobs:
 
       - name: 'Running local action with base64 encoded mapping'
         id: base64-mapping
-        uses: ./
+        uses: $/
         with:
           vault_mapping_json: ${{ steps.encode-mapping.outputs.encoded }}
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
@@ -316,7 +310,7 @@ jobs:
       - name: 'Running local action with malformed vault mapping'
         id: malformed-mapping
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           vault_mapping_json: 'neither-base64-nor-json!'
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
