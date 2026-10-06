@@ -27,6 +27,11 @@ inputs:
     description: "JSON array of credential item names this repository may load via credential_name (e.g. '[\"sdc-onap-ui-common\"]'). Wire this from the administrator-controlled CREDENTIAL_LOAD_GRANTS repository variable; project teams without repository administration rights cannot set it themselves"
     required: false
     default: ''
+  field:
+    # yamllint disable-line rule:line-length
+    description: "1Password field to read from the item (e.g. 'username', or one part of a multi-part credential). An empty value selects 'password'. Grants authorise a whole item, so selecting a field needs no grant of its own"
+    required: false
+    default: 'password'
   export_env:
     # yamllint disable-line rule:line-length
     description: "Export credential as CREDENTIAL env var for all later steps ('true'/'false')"
@@ -205,6 +210,7 @@ runs:
         REPOSITORY: ${{ github.event.repository.name }}
         CREDENTIAL_NAME: ${{ inputs.credential_name }}
         CREDENTIAL_GRANTS: ${{ inputs.credential_grants_json }}
+        FIELD: ${{ inputs.field }}
         EXPORT_ENV: ${{ inputs.export_env }}
       run: |
         # Validate the export_env input accepts only boolean strings
@@ -228,6 +234,19 @@ runs:
               exit 1 ;;
           esac
         fi
+        # A composite action applies an input default only when the
+        # input is absent, so an empty value (e.g. an unset matrix
+        # key) falls back to the historical 'password' field here.
+        # The same character set applies: '/' would select an item
+        # section and '?' would append op:// query attributes, so
+        # neither may reach the reference
+        field="${FIELD:-password}"
+        case "${field}" in
+          *[!A-Za-z0-9._-]*)
+            echo 'Error: invalid field ❌'
+            echo 'Allowed characters: A-Z a-z 0-9 . _ -'
+            exit 1 ;;
+        esac
         # Derive and validate the repository-scoped credential path
         if [ -z "${VAULT}" ]; then
           echo 'Error: no vault mapped for repository owner ❌'; exit 1
@@ -279,8 +298,9 @@ runs:
             # Audit trail: overrides are always visible in the run log
             # and step summary
             echo "::notice::credential-load-action override active:" \
-              "loading item '${item}' (granted via allowlist)"
-            echo "Credential override active: ${item} 🔓" \
+              "loading field '${field}' of item '${item}'" \
+              "(granted via allowlist)"
+            echo "Credential override active: ${item}/${field} 🔓" \
               >> "$GITHUB_STEP_SUMMARY"
           fi
         else
@@ -308,7 +328,16 @@ runs:
             echo 'Allowed characters: A-Z a-z 0-9 . _ -'
             exit 1 ;;
         esac
-        echo "path=op://${VAULT}/${item}/password" >> "$GITHUB_OUTPUT"
+        # Overrides already announced their field above; record a
+        # non-default field on the repository's own item as well, so
+        # every departure from the historical path stays auditable
+        if [ "${item}" = "${own_name}" ] && [ "${field}" != 'password' ]; then
+          echo "::notice::credential-load-action loading field" \
+            "'${field}' of item '${item}'"
+          echo "Credential field selected: ${item}/${field} 🔑" \
+            >> "$GITHUB_STEP_SUMMARY"
+        fi
+        echo "path=op://${VAULT}/${item}/${field}" >> "$GITHUB_OUTPUT"
 
     - name: 'Load secrets from 1Password'
       id: load_secrets

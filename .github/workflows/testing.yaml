@@ -8,8 +8,11 @@ name: 'Test GitHub Action 🧪'
 # yamllint disable-line rule:truthy
 on:
   workflow_dispatch:
-  # Vault JSON is a secret; no access on pull requests
-  # Testing can only be performed once code is merged
+  # Vault JSON is a secret with no access on pull requests, so the
+  # 1Password tests run once code is merged; the hermetic path
+  # derivation tests need no secrets and also run on pull requests
+  pull_request:
+    branches: ['main']
   push:
     branches: ['main']
 
@@ -20,9 +23,110 @@ concurrency:
 permissions: {}
 
 jobs:
+  ### Hermetic credential path derivation tests ###
+  # Runs the action's own path derivation script, extracted from
+  # action.yaml, against fixed inputs. It needs no secrets and makes no
+  # 1Password call, so it covers valid non-default fields and every
+  # rejection path on pull requests too
+  path-derivation:
+    name: 'Test credential path derivation'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      # Harden the runner used by this workflow
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Exercise path derivation with fixed inputs'
+        shell: bash
+        run: |
+          # Test the shipped derivation step rather than a copy of it
+          script="${RUNNER_TEMP}/derive.sh"
+          yq -r '.runs.steps[] | select(.id == "credential_path") | .run' \
+            action.yaml > "${script}"
+          if [ ! -s "${script}" ]; then
+            echo 'Could not extract the derivation step from action.yaml ❌'
+            exit 1
+          fi
+          log="${RUNNER_TEMP}/derive.log"
+          # derive CREDENTIAL_NAME GRANTS FIELD: print the derived path,
+          # or REJECTED when the script fails
+          derive() {
+            local out
+            out=$(mktemp)
+            if env -i PATH="${PATH}" GITHUB_OUTPUT="${out}" \
+              GITHUB_STEP_SUMMARY=/dev/null \
+              GITHUB_REPOSITORY='example-org/example-repo' \
+              VAULT='test-vault' REPOSITORY='example-repo' \
+              EXPORT_ENV='false' CREDENTIAL_NAME="$1" \
+              CREDENTIAL_GRANTS="$2" FIELD="$3" \
+              bash -eo pipefail "${script}" > "${log}" 2>&1; then
+              sed -n 's/^path=//p' "${out}"
+            else
+              echo 'REJECTED'
+            fi
+          }
+          failures=0
+          expect() {
+            if [ "$2" = "$3" ]; then
+              echo "✅ $1"
+            else
+              echo "❌ $1: expected '$2', got '$3'"
+              failures=$((failures + 1))
+            fi
+          }
+          own='op://test-vault/example-repo'
+          expect 'Absent field selects password' \
+            "${own}/password" "$(derive '' '' '')"
+          expect 'Explicit password field' \
+            "${own}/password" "$(derive '' '' 'password')"
+          expect 'Non-default field of own item' \
+            "${own}/username" "$(derive '' '' 'username')"
+          if grep -q "loading field 'username'" "${log}"; then
+            echo '✅ Non-default field of own item emits a notice'
+          else
+            echo '❌ Non-default field of own item emitted no notice'
+            failures=$((failures + 1))
+          fi
+          expect 'Own name override with field' \
+            "${own}/config" "$(derive 'example-repo' '' 'config')"
+          expect 'Granted override with field' \
+            'op://test-vault/sigul/pki' "$(derive 'sigul' '["sigul"]' 'pki')"
+          expect 'Granted override with empty field' \
+            'op://test-vault/sigul/password' \
+            "$(derive 'sigul' '["sigul"]' '')"
+          expect 'Section path in field rejected' \
+            'REJECTED' "$(derive '' '' 'section/password')"
+          expect 'Query attribute in field rejected' \
+            'REJECTED' "$(derive '' '' 'password?attribute=otp')"
+          expect 'Newline in field rejected' \
+            'REJECTED' "$(derive '' '' $'pass\nword')"
+          expect 'Whitespace in field rejected' \
+            'REJECTED' "$(derive '' '' ' password')"
+          expect 'Ungranted override rejected whatever the field' \
+            'REJECTED' "$(derive 'other' '' 'pki')"
+          if [ "${failures}" -ne 0 ]; then
+            echo "Path derivation tests failed: ${failures} ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo 'Path derivation tests passed ✅' >> "$GITHUB_STEP_SUMMARY"
+
   ### Test the GitHub Action in this Repository ###
   tests:
     name: 'Test local GitHub Action'
+    # The 1Password secrets are unavailable to pull requests
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # Gate secret access behind a dedicated environment so the 1Password
     # service account token is only reachable from this protected context
@@ -329,3 +433,113 @@ jobs:
           fi
           echo 'Malformed vault mapping rejection test passed ✅' \
             >> "$GITHUB_STEP_SUMMARY"
+
+      # The field input selects which field of the item to read. Naming
+      # the default field explicitly, or passing an empty value (which
+      # falls back to it, as an unset matrix key would), must resolve
+      # the same known test credential
+      - name: 'Running local action with explicit default field'
+        id: field-explicit
+        uses: $/
+        with:
+          vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+          op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          field: 'password'
+
+      - name: 'Running local action with empty field'
+        id: field-empty
+        uses: $/
+        with:
+          vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+          op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          field: ''
+
+      - name: 'Verify field selection loaded the expected credential'
+        shell: bash
+        env:
+          EXPLICIT_CREDENTIAL: ${{ steps.field-explicit.outputs.credential }}
+          EMPTY_CREDENTIAL: ${{ steps.field-empty.outputs.credential }}
+        run: |
+          # Both invocations read the password field, so each must match
+          # the known test value. The expected hash is a fixed constant;
+          # the computed hash is never printed.
+          EXPECTED='c78aa738682ce8468b3869c035d207e3c7eb8a9f'
+          for name in EXPLICIT_CREDENTIAL EMPTY_CREDENTIAL; do
+            value="${!name}"
+            if [ -z "${value}" ]; then
+              echo "Field test produced no credential: ${name} ❌"
+              echo "Field test produced no credential: ${name} ❌" \
+                >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            ACTUAL=$(printf '%s' "${value}" | sha1sum | awk '{print $1}')
+            if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+              echo "Field test credential mismatch: ${name} ❌"
+              echo "Field test credential mismatch: ${name} ❌" \
+                >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          done
+          echo 'Field selection tests passed ✅' >> "$GITHUB_STEP_SUMMARY"
+
+      # A field outside the allowed character set must fail during path
+      # derivation, before any 1Password call: '/' would select an item
+      # section, '?' would append op:// query attributes, and a newline
+      # could split the reference
+      - name: 'Running local action with section path in field'
+        id: field-section
+        continue-on-error: true
+        uses: $/
+        with:
+          vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+          op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          field: 'section/password'
+
+      - name: 'Running local action with query attribute in field'
+        id: field-query
+        continue-on-error: true
+        uses: $/
+        with:
+          vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+          op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          field: 'password?attribute=otp'
+
+      - name: 'Running local action with newline in field'
+        id: field-newline
+        continue-on-error: true
+        uses: $/
+        with:
+          vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+          op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          field: "pass\nword"
+
+      # A well-formed field the item does not carry must fail closed in
+      # the 1Password load, rather than yield an empty credential
+      - name: 'Running local action with absent field'
+        id: field-absent
+        continue-on-error: true
+        uses: $/
+        with:
+          vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+          op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          field: 'no-such-field'
+
+      - name: 'Verify invalid and absent fields were rejected'
+        shell: bash
+        env:
+          SECTION_OUTCOME: ${{ steps.field-section.outcome }}
+          QUERY_OUTCOME: ${{ steps.field-query.outcome }}
+          NEWLINE_OUTCOME: ${{ steps.field-newline.outcome }}
+          ABSENT_OUTCOME: ${{ steps.field-absent.outcome }}
+        run: |
+          # Failure testing is also important; every step above MUST fail
+          for name in SECTION_OUTCOME QUERY_OUTCOME NEWLINE_OUTCOME \
+            ABSENT_OUTCOME; do
+            if [ "${!name}" = 'success' ]; then
+              echo "Field rejection test unexpectedly succeeded: ${name} ❌"
+              echo "Field rejection test unexpectedly succeeded: ${name} ❌" \
+                >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          done
+          echo 'Field rejection tests passed ✅' >> "$GITHUB_STEP_SUMMARY"
