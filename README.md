@@ -53,14 +53,15 @@ steps:
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                     | Required | Default | Description                                                                                                                         |
-| ------------------------ | -------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| op_service_account_token | True     | n/a     | 1Password service account token                                                                                                     |
-| vault_mapping_json       | True     | n/a     | JSON mapping repository owner to 1Password vault; base64 encoded (preferred) or plain JSON                                          |
-| credential_name          | False    | ''      | Explicit 1Password item name; overrides the derived repository name (grant required when it differs from the repository's own name) |
-| credential_grants_json   | False    | ''      | JSON array of item names this repository may load via `credential_name`; wire from the `CREDENTIAL_LOAD_GRANTS` repository variable |
-| export_env               | False    | false   | Export credential as the `CREDENTIAL` environment variable for all later steps                                                      |
-| checkout                 | False    | false   | Check out the repository as part of this action; opt in with `true` when a later step needs the default branch checked out          |
+| Name                     | Required | Default  | Description                                                                                                                         |
+| ------------------------ | -------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| op_service_account_token | True     | n/a      | 1Password service account token                                                                                                     |
+| vault_mapping_json       | True     | n/a      | JSON mapping repository owner to 1Password vault; base64 encoded (preferred) or plain JSON                                          |
+| credential_name          | False    | ''       | Explicit 1Password item name; overrides the derived repository name (grant required when it differs from the repository's own name) |
+| credential_grants_json   | False    | ''       | JSON array of item names this repository may load via `credential_name`; wire from the `CREDENTIAL_LOAD_GRANTS` repository variable |
+| field                    | False    | password | 1Password field to read from the item; an empty value selects `password` (see [Selecting a Field](#selecting-a-field))              |
+| export_env               | False    | false    | Export credential as the `CREDENTIAL` environment variable for all later steps                                                      |
+| checkout                 | False    | false    | Check out the repository as part of this action; opt in with `true` when a later step needs the default branch checked out          |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -141,12 +142,15 @@ Regardless of the input encoding, the action masks each vault identifier
 in the mapping (via `::add-mask::`) so vault identifiers never appear in
 workflow logs.
 
-This is then combined with the credential item name to form the full path to
-the password item:
+This is then combined with the credential item name and field to form the
+full path to the credential:
 
 ```text
-op://${{ steps.vault_lookup.outputs.value }}/<item-name>/password
+op://${{ steps.vault_lookup.outputs.value }}/<item-name>/<field>
 ```
+
+The field defaults to `password` (see
+[Selecting a Field](#selecting-a-field)).
 
 The action resolves the item name as follows:
 
@@ -167,11 +171,13 @@ repositories, where the stored credential name can differ from the mirror
 repository name (for example, Gerrit project `sdc/onap-ui-common` maps to
 credential name `sdc-onap-ui-common`).
 
-The action validates both the vault identifier and the resolved item name
-against a strict character set before use, preventing manipulation of the
-`op://` path structure. Each value must match `[A-Za-z0-9._-]+` (ASCII
+The action validates the vault identifier, the resolved item name and the
+field against a strict character set before use, preventing manipulation of
+the `op://` path structure. Each value must match `[A-Za-z0-9._-]+` (ASCII
 letters, digits, dot, underscore, and hyphen); any other character, including
-whitespace or an embedded newline, causes the action to fail.
+whitespace or an embedded newline, causes the action to fail. For the field,
+this also rules out `/`, which would select a section within the item, and
+`?`, which would append `op://` query attributes.
 
 ### Override Grants
 
@@ -207,7 +213,8 @@ from `vars.CREDENTIAL_LOAD_GRANTS` internally and do not expose it as a
 caller-facing input.
 
 Every active override emits a `notice` annotation in the run log and a line
-in the step summary, providing an audit trail.
+in the step summary, providing an audit trail. The notice names both the
+item and the field loaded.
 
 Note the residual trust boundary: the 1Password service account token grants
 vault-wide read access, so code that holds the token can read any item in
@@ -216,6 +223,71 @@ auditability within the maintained actions estate, but cannot substitute
 for token scoping. For release jobs, prefer binding
 `OP_SERVICE_ACCOUNT_TOKEN` to a protected GitHub environment (with branch
 restrictions and/or required reviewers) to gate token access itself.
+
+For the most sensitive material, such as signing credentials, keep it out of
+the vault that routine publishing jobs can read. Store it in a dedicated
+vault, readable by a separate service account whose token, and matching
+vault mapping, reach the signing job alone (as GitHub environment secrets,
+or organisation secrets restricted to selected repositories). The action
+needs no special configuration for this: it resolves whichever vault the
+mapping it receives names for the repository owner.
+
+### Selecting a Field
+
+By default the action reads the item's `password` field. The optional
+`field` input reads a different field of the same item, so one item can hold
+every part of a multi-part credential, instead of one item per part:
+
+<!-- markdownlint-disable MD013 -->
+
+```yaml
+  - name: "Load Sigul client configuration"
+    id: sigul-config
+    uses: lfreleng-actions/credential-load-action@main
+    with:
+      vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+      op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+      credential_name: 'sigul'
+      credential_grants_json: ${{ vars.CREDENTIAL_LOAD_GRANTS }}
+      field: 'config'
+
+  - name: "Load Sigul key passphrase"
+    id: sigul-password
+    uses: lfreleng-actions/credential-load-action@main
+    with:
+      vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+      op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+      credential_name: 'sigul'
+      credential_grants_json: ${{ vars.CREDENTIAL_LOAD_GRANTS }}
+```
+
+<!-- markdownlint-enable MD013 -->
+
+Each invocation reads one field and returns it through the usual
+`credential` output; invoke the action once per field needed. A token pair
+stored as a 1Password login item, for example, loads with `field: username`
+and then the default `password`.
+
+Grants authorise a whole item: a grant for `sigul` permits every field of
+that item. The fields of one item are facets of a single credential, issued
+and rotated together, and the grant is a guardrail rather than the security
+boundary (see above), so a finer granularity would add configuration without
+adding protection. Selecting a non-default field of the repository's own
+item needs no grant, but still emits a `notice` naming the field.
+
+An empty `field` value selects `password`, so a matrix entry without a
+field keeps the historical behaviour. A field the item does not carry fails
+the action.
+
+The runner masks a loaded value, and each individual line of a multi-line
+value, in workflow logs. Masking every line means short lines common to a
+configuration file, such as an INI section header, become masked wherever
+they appear in the log. Where the consuming action accepts it, store
+multi-line or binary material base64 encoded in a concealed field, so the
+value masks as one opaque string.
+
+File attachments (1Password documents) are out of scope; base64 encode the
+content into a concealed field instead.
 
 ### Consuming the Credential
 
@@ -243,7 +315,9 @@ to steps that explicitly reference it.
 
 Set `export_env: 'true'` when you need the credential available to every later
 step in the job as the `CREDENTIAL` environment variable. This broadens
-exposure, so prefer the output where practical.
+exposure, so prefer the output where practical. Every invocation exports the
+same variable name, so a job loading more than one credential or field must
+use the output instead: a later invocation would overwrite the earlier value.
 
 <!-- markdownlint-disable MD013 -->
 
@@ -276,6 +350,30 @@ exposure, so prefer the output where practical.
 When `export_env` is `true`, the credential is instead exported into the job
 environment as `CREDENTIAL` and the `credential` output is empty.
 
+## Using Credentials Across Jobs
+
+Load a credential in the job that uses it, and never pass a loaded
+credential from one job to another. Every channel between jobs is unsuitable:
+
+<!-- markdownlint-disable MD013 -->
+
+| Channel            | Problem                                                                                                                    |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| Job outputs        | The runner drops a job output containing a masked value, so the credential never arrives                                   |
+| Artefacts          | Kept for the retention period and downloadable with read access, which on a public repository means any signed-in user     |
+| Caches             | Readable by later runs, including pull request runs on branches based on the branch that saved the cache                   |
+| Encrypted hand-off | Needs a key shared between the jobs, which is itself a secret; loading the credential directly is simpler and no weaker    |
+
+<!-- markdownlint-enable MD013 -->
+
+What passes between jobs is the means to load: the service account token and
+vault mapping secrets, the `CREDENTIAL_LOAD_GRANTS` variable, and the
+non-secret `credential_name` and `field` values. Each job that needs a
+credential invokes this action itself and loads what it uses, and no more.
+A job that runs project code should load nothing, handing its output to a
+later job as an artefact; that later job loads the credential and publishes
+or signs the artefact without running the project's code.
+
 ## Implementation Details
 
 <!-- markdownlint-disable MD013 -->
@@ -284,12 +382,12 @@ environment as `CREDENTIAL` and the `credential` output is empty.
 2. **Checkout**: Optionally checks out the repository with `persist-credentials: false` (requires `checkout: 'true'`; skipped by default)
 3. **Mapping Normalisation**: Decodes the vault mapping from base64 (falling back to plain JSON), validates it, and masks each vault identifier
 4. **Vault Lookup**: Uses the repository owner as a key to look up the vault from the JSON mapping
-5. **Path Derivation**: Builds and validates a repository-scoped `op://` path from trusted GitHub context, with `credential_name` as an optional item-name override (grant-gated when it names a different item) and `GITHUB_REPOSITORY` as a fallback when `github.event.repository.name` is absent
+5. **Path Derivation**: Builds and validates a repository-scoped `op://` path from trusted GitHub context, with `credential_name` as an optional item-name override (grant-gated when it names a different item), `field` selecting the item field (default `password`), and `GITHUB_REPOSITORY` as a fallback when `github.event.repository.name` is absent
 6. **Credential Loading**: Loads the credential from 1Password using the derived vault and item name
 
 ## Notes
 
-- The action loads credentials using the pattern: `op://{vault}/{item-name}/password`, where the item name defaults to the repository name
+- The action loads credentials using the pattern: `op://{vault}/{item-name}/{field}`, where the item name defaults to the repository name and the field to `password`
 - The vault mapping JSON should map repository owner names to their corresponding 1Password vaults; store it base64 encoded to preserve log redaction
 - By default the action exposes the credential via the `credential` output; set `export_env: 'true'` to use the `CREDENTIAL` environment variable instead
 - The action needs no repository files itself, so it performs no checkout
