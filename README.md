@@ -397,3 +397,48 @@ or signs the artefact without running the project's code.
   jobs) with the default GitHub context. Set `checkout: 'true'` when a
   later step needs the default branch present and the job performs no
   checkout of its own (versions before v2 checked out unconditionally)
+
+## 1Password CLI Version Bump
+
+`action.yaml` pins the 1Password CLI that `1password/load-secrets-action`
+downloads, through its `version:` input, so that zizmor's auditor persona does
+not report an unpinned tool. Dependabot cannot see that pin, so
+[`op-cli-version-check.yaml`](.github/workflows/op-cli-version-check.yaml)
+compares it every Tuesday against the latest stable release.
+
+When a newer release exists, the workflow:
+
+- Raises a pull request from the fixed branch `chore/op-cli-bump` that
+  rewrites the one `version:` line, titled
+  `Chore: Bump 1Password CLI from <pinned> to <latest>`. A later release
+  updates the open pull request in place; a run that finds it already
+  carrying the change against the current default branch leaves its branch,
+  and so its reviews, alone, and rebuilds it from the default branch
+  otherwise. If the default branch moves before the new commit reaches the
+  proposal branch, the workflow discards that commit and the update waits for
+  the next run.
+- Posts a Slack message linking the pull request, when `SLACK_BOT_TOKEN` and
+  `SLACK_CHANNEL_ID` exist.
+
+When the default branch already pins the latest release, for example after a
+bump by hand, the workflow closes any open proposal with a comment, deletes
+its branch and reports the retirement to Slack. It reads the default branch
+again before closing anything; if the branch moved during the run, the
+retirement waits for the next run.
+
+The pull request comes from the LF RelEng bot GitHub App, which needs the
+`LF_RELENG_BOT_CLIENT_ID` variable and the `LF_RELENG_BOT_PRIVATE_KEY` secret
+reachable from the `notifications` environment. The workflow mints a token
+for this repository alone, with contents and pull requests write, and creates
+the commit through the GraphQL API so that GitHub signs it. Without that
+credential the workflow warns and sends the Slack reminder to bump the
+version by hand.
+
+A manual run accepts two inputs:
+
+- `dry_run`: prints the rewritten line, the pull request title and the
+  branch, without minting a token, writing to the repository or posting to
+  Slack. It plans against the default branch, as a real run does, whichever
+  ref it runs from.
+- `test_notification`: sends a labelled test message to Slack even when the
+  pin is current. A dry run suppresses it.
