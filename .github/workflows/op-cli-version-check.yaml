@@ -2,14 +2,42 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# Weekly 1Password CLI version reminder.
+# Weekly 1Password CLI version check and bump.
 #
 # The 1Password `op` CLI version consumed by this action is pinned in
 # action.yaml (via the load-secrets-action `version` input) so that
 # zizmor's auditor persona does not flag it as an unpinned tool. Because
-# the version is pinned it no longer updates on its own, so this workflow
-# compares the pinned value against the latest stable release every
-# Tuesday morning and posts a Slack reminder when a newer version exists.
+# the version is pinned it no longer updates on its own, and Dependabot
+# cannot see it, so this workflow compares the pinned value against the
+# latest stable release every Tuesday morning.
+#
+# When a newer release exists, the workflow raises a pull request that
+# rewrites the one `version:` line in action.yaml, from the fixed branch
+# chore/op-cli-bump, and posts a Slack message linking it:
+#
+# - The commit is created with the createCommitOnBranch GraphQL
+#   mutation, never pushed, so GitHub signs it. It is built on a
+#   staging ref (chore/op-cli-bump-staging) at the default branch and
+#   the proposal branch is then moved onto it, so the proposal branch
+#   never points at the default branch (GitHub would close the PR).
+# - A newer release supersedes an open proposal in place. If the open
+#   proposal already carries exactly this change against the current
+#   default branch, the branch is left alone so its reviews survive;
+#   only a stale title or body changes. Otherwise it is rebuilt.
+# - If the default branch already pins the latest release or newer
+#   (for example after a bump by hand), an open proposal is closed
+#   with a comment and its branch deleted. The default branch is read
+#   again before any write; if it moved since the plan, the bump is
+#   planned again. If it moves later, just before a retirement or
+#   before the new commit is promoted, the write waits for the next
+#   run.
+#
+# The writes use an installation token of the LF RelEng bot GitHub App
+# (vars.LF_RELENG_BOT_CLIENT_ID and secrets.LF_RELENG_BOT_PRIVATE_KEY),
+# minted for this repository alone with contents and pull-requests
+# write. The commit's Signed-off-by is built from the App's bot user at
+# runtime. Without both credentials the workflow warns and falls back
+# to the Slack reminder, asking for a bump by hand.
 #
 # Slack delivery is optional: it only fires when the SLACK_BOT_TOKEN
 # secret and SLACK_CHANNEL_ID variable are configured. The step summary
@@ -18,14 +46,20 @@
 # A manual run (workflow_dispatch) accepts a 'test_notification' input
 # that forces a clearly-labelled test message even when the pinned
 # version is already current, so the Slack wiring can be validated on
-# demand.
+# demand. Its 'dry_run' input reports the rewritten line, the pull
+# request title and the branch without minting a token, writing to the
+# repository or posting the reminder. Both modes plan the bump the same
+# way, against the default branch as it is now, read with the job's
+# read-only token.
 #
 # The job is bound to a dedicated 'notifications' environment so the
-# Slack bot token is only reachable from this context (satisfying
-# zizmor's secrets-outside-env audit). Ensure SLACK_BOT_TOKEN and
-# SLACK_CHANNEL_ID are reachable there; repository-level secrets and
-# variables are inherited automatically. Keep the environment free of
-# required-reviewer rules so scheduled runs are not blocked.
+# Slack bot token and the App private key are only reachable from this
+# context (satisfying zizmor's secrets-outside-env audit). Ensure
+# SLACK_BOT_TOKEN, SLACK_CHANNEL_ID, LF_RELENG_BOT_CLIENT_ID and
+# LF_RELENG_BOT_PRIVATE_KEY are reachable there; repository and
+# organisation secrets and variables are inherited automatically. Keep
+# the environment free of required-reviewer rules so scheduled runs are
+# not blocked.
 name: '1Password CLI Version Check 🔔'
 
 # yamllint disable-line rule:truthy
@@ -36,15 +70,24 @@ on:
         description: 'Force a test Slack notification to verify wiring'
         type: boolean
         default: false
+      dry_run:
+        description: 'Report the bump that would be raised; write nothing'
+        type: boolean
+        default: false
   schedule:
     # 08:00 UTC every Tuesday
     - cron: '0 8 * * 2'
 
+# One run at a time across refs, since every run writes the same branch.
+# A run cancelled half-way through a write is worse than a queued one.
 concurrency:
-  group: '${{ github.workflow }}-${{ github.ref }}'
-  cancel-in-progress: true
+  group: '${{ github.workflow }}'
+  cancel-in-progress: false
 
 permissions: {}
+
+env:
+  GH_TELEMETRY: 'false'
 
 jobs:
   check-op-cli-version:
@@ -54,7 +97,7 @@ jobs:
     environment: 'notifications'
     permissions:
       contents: read
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       # Harden the runner used by this workflow
       # yamllint disable-line rule:line-length
@@ -87,7 +130,10 @@ jobs:
             msg='Could not read pinned op CLI version from action.yaml'
             echo "::warning::${msg}"
             echo "⚠️ ${msg}" >> "$GITHUB_STEP_SUMMARY"
-            echo 'notify=false' >> "$GITHUB_OUTPUT"
+            {
+              echo 'notify=false'
+              echo 'resolved=false'
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Resolve the latest stable CLI2 release. Failures here are
@@ -102,7 +148,10 @@ jobs:
             echo "::warning::${msg}"
             echo "⚠️ ${msg} (endpoint: ${LATEST_URL})" \
               >> "$GITHUB_STEP_SUMMARY"
-            echo 'notify=false' >> "$GITHUB_OUTPUT"
+            {
+              echo 'notify=false'
+              echo 'resolved=false'
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # A newer release exists only when 'latest' sorts above the
@@ -137,6 +186,8 @@ jobs:
             echo "notify=${notify}"
             echo "headline=${headline}"
             echo "detail=${detail}"
+            echo "outdated=${outdated}"
+            echo 'resolved=true'
           } >> "$GITHUB_OUTPUT"
           # Always surface the outcome in the job summary.
           if [ "${outdated}" = 'true' ]; then
@@ -163,9 +214,473 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: 'Check bot credentials'
+        id: check-bot
+        if: >-
+          steps.compare.outputs.resolved == 'true'
+          && inputs.dry_run != true
+        shell: bash
+        env:
+          CLIENT_ID: '${{ vars.LF_RELENG_BOT_CLIENT_ID }}'
+          PRIVATE_KEY: '${{ secrets.LF_RELENG_BOT_PRIVATE_KEY }}'
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${CLIENT_ID}" ] \
+            || missing+=('variable LF_RELENG_BOT_CLIENT_ID')
+          [ -n "${PRIVATE_KEY}" ] \
+            || missing+=('secret LF_RELENG_BOT_PRIVATE_KEY')
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          list="$(printf '%s, ' "${missing[@]}")"
+          msg="No bot credential (missing ${list%, }); not raising a PR"
+          echo "::warning::${msg}"
+          echo "⚠️ ${msg}" >> "$GITHUB_STEP_SUMMARY"
+          echo 'available=false' >> "$GITHUB_OUTPUT"
+
+      - name: 'Plan the version bump'
+        id: plan
+        if: >-
+          steps.compare.outputs.resolved == 'true'
+          && (inputs.dry_run == true
+          || steps.check-bot.outputs.available == 'true')
+        shell: bash
+        env:
+          # Read-only job token: planning writes nothing
+          GH_TOKEN: '${{ github.token }}'
+          LATEST: '${{ steps.compare.outputs.latest }}'
+          BRANCH: 'chore/op-cli-bump'
+          DRY_RUN: '${{ inputs.dry_run }}'
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          work="${RUNNER_TEMP}/op-cli-bump"
+          mkdir -p "${work}"
+          # Plan against the default branch as it is now, not the
+          # commit this run checked out, so a dry run and a real run
+          # plan the same bump.
+          base_branch="$(gh api "repos/${repo}" --jq '.default_branch')"
+          base_sha="$(gh api "repos/${repo}/git/ref/heads/${base_branch}" \
+            --jq '.object.sha // empty')"
+          if [ -z "${base_sha}" ]; then
+            echo "::error::Could not resolve ${base_branch}"
+            exit 1
+          fi
+          gh api -H 'Accept: application/vnd.github.raw+json' \
+            "repos/${repo}/contents/action.yaml?ref=${base_sha}" \
+            > "${work}/base.yaml"
+          bash .github/scripts/op-cli-bump-rewrite.sh "${work}/base.yaml" \
+            "${work}/action.yaml" "${LATEST}" > "${work}/plan.txt"
+          field() {
+            sed -n "s/^$1=//p" "${work}/plan.txt"
+          }
+          pinned="$(field pinned)"
+          outdated="$(field outdated)"
+          {
+            echo "base_branch=${base_branch}"
+            echo "base_sha=${base_sha}"
+            echo "pinned=${pinned}"
+            echo "outdated=${outdated}"
+          } >> "$GITHUB_OUTPUT"
+          if [ "${outdated}" = 'true' ]; then
+            title="$(field title)"
+            new_line="$(field new_line)"
+            echo "Rewritten line: ${new_line}"
+            echo "Title: ${title}"
+            echo "Branch: ${BRANCH}"
+          else
+            echo "${base_branch} pins ${pinned}; latest is ${LATEST}"
+          fi
+          if [ "${DRY_RUN:-false}" != 'true' ]; then
+            exit 0
+          fi
+          {
+            echo ''
+            echo '### Dry run: nothing written'
+            echo ''
+            if [ "${outdated}" = 'true' ]; then
+              echo "- Rewritten line: \`${new_line}\`"
+              echo "- Title: \`${title}\`"
+              echo "- Branch: \`${BRANCH}\`"
+            else
+              echo "- \`${base_branch}\` pins \`${pinned}\`, latest is" \
+                "\`${LATEST}\`: no bump to raise."
+              echo "- A real run would close any open proposal from" \
+                "\`${BRANCH}\` and delete that branch."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 'Mint bot token'
+        id: mint
+        if: steps.check-bot.outputs.available == 'true'
+        # yamllint disable-line rule:line-length
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: '${{ vars.LF_RELENG_BOT_CLIENT_ID }}'
+          private-key: '${{ secrets.LF_RELENG_BOT_PRIVATE_KEY }}'
+          owner: '${{ github.repository_owner }}'
+          repositories: '${{ github.event.repository.name }}'
+          permission-contents: 'write'
+          permission-pull-requests: 'write'
+
+      - name: 'Resolve bot identity'
+        id: identity
+        if: steps.check-bot.outputs.available == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: '${{ steps.mint.outputs.token }}'
+          APP_SLUG: '${{ steps.mint.outputs.app-slug }}'
+        run: |
+          set -euo pipefail
+          user="${APP_SLUG}[bot]"
+          id="$(gh api "users/${user}" --jq '.id')"
+          if ! [[ "${id}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not resolve the user ID of ${user}"
+            exit 1
+          fi
+          email="${id}+${user}@users.noreply.github.com"
+          echo "signoff=Signed-off-by: ${user} <${email}>" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: 'Raise pull requests'
+        id: raise
+        if: steps.check-bot.outputs.available == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: '${{ steps.mint.outputs.token }}'
+          LATEST: '${{ steps.compare.outputs.latest }}'
+          SIGNOFF: '${{ steps.identity.outputs.signoff }}'
+          BASE_BRANCH: '${{ steps.plan.outputs.base_branch }}'
+          BASE_SHA: '${{ steps.plan.outputs.base_sha }}'
+          BRANCH: 'chore/op-cli-bump'
+          NOTES_URL: 'https://app-updates.agilebits.com/product_history/CLI2'
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          staging="${BRANCH}-staging"
+          work="${RUNNER_TEMP}/op-cli-bump"
+          workflow_url="${GITHUB_SERVER_URL}/${repo}/actions/workflows"
+          workflow_url="${workflow_url}/op-cli-version-check.yaml"
+
+          # On an error status gh api skips --jq and prints the error
+          # body to stdout, so print the SHA only when the call succeeds.
+          ref_sha() {
+            local sha
+            if sha="$(gh api "repos/${repo}/git/ref/heads/$1" \
+                --jq '.object.sha // empty' 2> /dev/null)"; then
+              printf '%s\n' "${sha}"
+            fi
+          }
+          raw_file() {
+            gh api -H 'Accept: application/vnd.github.raw+json' \
+              "repos/${repo}/contents/action.yaml?ref=$1"
+          }
+          field() {
+            sed -n "s/^$1=//p" "${work}/plan.txt"
+          }
+          delete_ref() {
+            gh api -X DELETE "repos/${repo}/git/refs/heads/$1" > /dev/null
+          }
+          # Leave the proposal as it is when the default branch moved
+          # during the run; the next run plans against its new head.
+          defer_run() {
+            local msg="${base_branch} moved during this run; $1"
+            msg="${msg} The next run will check again."
+            echo "::warning::${msg}"
+            echo "⚠️ ${msg}" >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo 'outcome=deferred'
+              echo "pr_number=${pr_number}"
+              echo "pr_url=${pr_url}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          # The plan step wrote plan.txt and action.yaml into ${work}
+          # from the default branch at ${BASE_SHA}. If the default
+          # branch moved since, plan again from its new head.
+          base_branch="${BASE_BRANCH}"
+          base_sha="${BASE_SHA}"
+          current_sha="$(ref_sha "${base_branch}")"
+          if [ -z "${current_sha}" ]; then
+            echo "::error::Could not resolve ${base_branch}"
+            exit 1
+          fi
+          if [ "${current_sha}" != "${base_sha}" ]; then
+            echo "${base_branch} moved to ${current_sha}; planning again"
+            base_sha="${current_sha}"
+            raw_file "${base_sha}" > "${work}/base.yaml"
+            bash .github/scripts/op-cli-bump-rewrite.sh \
+              "${work}/base.yaml" "${work}/action.yaml" "${LATEST}" \
+              > "${work}/plan.txt"
+          fi
+          pinned="$(field pinned)"
+          echo "pinned=${pinned}" >> "$GITHUB_OUTPUT"
+
+          head="${GITHUB_REPOSITORY_OWNER}:${BRANCH}"
+          gh api "repos/${repo}/pulls?state=open&head=${head}" \
+            --jq '.[0] // empty' > "${work}/pr.json"
+          pr_number="$(jq -r '.number // empty' "${work}/pr.json")"
+          pr_url="$(jq -r '.html_url // empty' "${work}/pr.json")"
+          branch_sha="$(ref_sha "${BRANCH}")"
+
+          if [ "$(field outdated)" != 'true' ]; then
+            # The default branch already pins the latest release or
+            # newer: retire any open proposal and its branch. Recheck
+            # that the default branch has not moved since the plan, so
+            # a pin reverted meanwhile cannot close a needed proposal.
+            outcome=none
+            if [ "$(ref_sha "${base_branch}")" != "${base_sha}" ]; then
+              defer_run 'not retiring the proposal.'
+            fi
+            if [ -n "${pr_number}" ]; then
+              jq -n --arg pinned "${pinned}" --arg latest "${LATEST}" \
+                '{body: ("`action.yaml` on the default branch already"
+                  + " pins `" + $pinned + "` and the latest stable"
+                  + " 1Password CLI release is `" + $latest + "`, so"
+                  + " this proposal is no longer needed. Closing it"
+                  + " and deleting its branch.")}' > "${work}/comment.json"
+              gh api "repos/${repo}/issues/${pr_number}/comments" \
+                --input "${work}/comment.json" > /dev/null
+              jq -n '{state: "closed"}' > "${work}/close.json"
+              gh api -X PATCH "repos/${repo}/pulls/${pr_number}" \
+                --input "${work}/close.json" > /dev/null
+              outcome=retired
+              echo "Closed ${pr_url}: ${base_branch} pins ${pinned}" \
+                >> "$GITHUB_STEP_SUMMARY"
+            fi
+            if [ -n "${branch_sha}" ]; then
+              delete_ref "${BRANCH}"
+            fi
+            {
+              echo "outcome=${outcome}"
+              echo "pr_number=${pr_number}"
+              echo "pr_url=${pr_url}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          title="$(field title)"
+          old_line="$(field old_line)"
+          new_line="$(field new_line)"
+          printf '%s\n' \
+            'The weekly 1Password CLI version check found a newer stable' \
+            'release of the op CLI than the one action.yaml pins. Raise' \
+            'the version input passed to 1password/load-secrets-action' \
+            "from ${pinned} to ${LATEST}." \
+            '' \
+            "Release notes: ${NOTES_URL}" \
+            '' \
+            "${SIGNOFF}" > "${work}/message.txt"
+          printf '%s\n' \
+            '## What' \
+            '' \
+            "Bump the 1Password CLI that \`1password/load-secrets-action\`" \
+            "downloads from \`${pinned}\` to \`${LATEST}\`, by changing" \
+            "the \`version:\` input in \`action.yaml\`." \
+            '' \
+            '## Why' \
+            '' \
+            'The pinned CLI version does not move on its own, and' \
+            'Dependabot cannot see it. The weekly' \
+            "[1Password CLI version check](${workflow_url}) found that" \
+            "\`${LATEST}\` is the latest stable release." \
+            '' \
+            "Release notes: <${NOTES_URL}>" \
+            '' \
+            '## Checks' \
+            '' \
+            "\`testing.yaml\` does not exercise the action on" \
+            "\`pull_request\`: the 1Password secrets are unavailable to" \
+            'pull requests. The bump is verified after merge, as' \
+            'hand-raised bumps are.' > "${work}/body.md"
+          jq -n --arg title "${title}" --rawfile body "${work}/body.md" \
+            '{title: $title, body: ($body | rtrimstr("\n"))}' \
+            > "${work}/fields.json"
+
+          # Settled: the open proposal already carries exactly this
+          # change. Leave its branch alone so reviews survive. The
+          # compare runs from the merge base, so also require the
+          # branch to replace the line the default branch pins now and
+          # to hold the planned file; otherwise a default branch that
+          # moved the pin since would leave the proposal conflicting.
+          settled=false
+          if [ -n "${pr_number}" ] && [ -n "${branch_sha}" ]; then
+            gh api "repos/${repo}/compare/${base_sha}...${branch_sha}" \
+              --jq '[.files[] | {filename, additions, deletions, patch}]' \
+              > "${work}/files.json"
+            raw_file "${branch_sha}" > "${work}/branch.yaml"
+            if jq -e --arg old "${old_line}" --arg new "${new_line}" \
+                'def changed($c): [.[0].patch // "" | split("\n")[]
+                  | select(startswith($c)) | .[1:]];
+                length == 1 and .[0].filename == "action.yaml"
+                and .[0].additions == 1 and .[0].deletions == 1
+                and changed("-") == [$old] and changed("+") == [$new]' \
+                "${work}/files.json" > /dev/null \
+              && cmp -s "${work}/branch.yaml" "${work}/action.yaml"; then
+              settled=true
+            fi
+          fi
+
+          if [ "${settled}" = 'true' ]; then
+            outcome=open
+          else
+            base64 -w0 "${work}/action.yaml" > "${work}/action.b64"
+            jq -n \
+              --arg repo "${repo}" \
+              --arg branch "${staging}" \
+              --arg head "${base_sha}" \
+              --arg headline "${title}" \
+              --rawfile body "${work}/message.txt" \
+              --rawfile contents "${work}/action.b64" \
+              '{query: ("mutation($input: CreateCommitOnBranchInput!) {"
+                  + " createCommitOnBranch(input: $input)"
+                  + " { commit { oid } } }"),
+                variables: {input: {
+                  branch: {repositoryNameWithOwner: $repo,
+                           branchName: $branch},
+                  expectedHeadOid: $head,
+                  message: {headline: $headline, body: $body},
+                  fileChanges: {additions: [
+                    {path: "action.yaml", contents: $contents}]}}}}' \
+              > "${work}/payload.json"
+
+            # Build on a staging ref at the default branch, so the
+            # proposal branch never points at the default branch.
+            if [ -n "$(ref_sha "${staging}")" ]; then
+              delete_ref "${staging}"
+            fi
+            jq -n --arg ref "refs/heads/${staging}" --arg sha "${base_sha}" \
+              '{ref: $ref, sha: $sha}' > "${work}/staging.json"
+            gh api "repos/${repo}/git/refs" \
+              --input "${work}/staging.json" > /dev/null
+            oid=''
+            if gh api graphql --input "${work}/payload.json" \
+              > "${work}/response.json"; then
+              oid="$(jq -r '.data.createCommitOnBranch.commit.oid // empty' \
+                "${work}/response.json")"
+            fi
+            if [ -z "${oid}" ]; then
+              echo '::error::GitHub refused the createCommitOnBranch mutation'
+              jq -c '.errors // empty' "${work}/response.json" || true
+              delete_ref "${staging}" || true
+              exit 1
+            fi
+
+            # A bump landing on the default branch during the calls
+            # above would leave this commit on a stale pin; recheck
+            # just before promoting it.
+            if [ "$(ref_sha "${base_branch}")" != "${base_sha}" ]; then
+              delete_ref "${staging}"
+              defer_run 'not updating the proposal.'
+            fi
+
+            jq -n --arg sha "${oid}" '{sha: $sha, force: true}' \
+              > "${work}/move.json"
+            if [ -n "${branch_sha}" ]; then
+              gh api -X PATCH "repos/${repo}/git/refs/heads/${BRANCH}" \
+                --input "${work}/move.json" > /dev/null
+            else
+              jq -n --arg ref "refs/heads/${BRANCH}" --arg sha "${oid}" \
+                '{ref: $ref, sha: $sha}' > "${work}/create.json"
+              gh api "repos/${repo}/git/refs" \
+                --input "${work}/create.json" > /dev/null
+            fi
+            delete_ref "${staging}"
+            outcome=updated
+          fi
+
+          if [ -z "${pr_number}" ]; then
+            jq --arg head "${BRANCH}" --arg base "${base_branch}" \
+              '. + {head: $head, base: $base}' "${work}/fields.json" \
+              > "${work}/create-pr.json"
+            gh api "repos/${repo}/pulls" --input "${work}/create-pr.json" \
+              > "${work}/pr.json"
+            pr_number="$(jq -r '.number' "${work}/pr.json")"
+            pr_url="$(jq -r '.html_url' "${work}/pr.json")"
+            outcome=raised
+          elif ! jq -e --slurpfile want "${work}/fields.json" \
+              '.title == $want[0].title and .body == $want[0].body' \
+              "${work}/pr.json" > /dev/null; then
+            gh api -X PATCH "repos/${repo}/pulls/${pr_number}" \
+              --input "${work}/fields.json" > /dev/null
+          fi
+
+          {
+            echo "outcome=${outcome}"
+            echo "pr_number=${pr_number}"
+            echo "pr_url=${pr_url}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Pull request (${outcome}): ${pr_url}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 'Compose notification'
+        id: compose
+        if: ${{ !cancelled() && steps.compare.outputs.resolved == 'true' }}
+        shell: bash
+        env:
+          NOTIFY: '${{ steps.compare.outputs.notify }}'
+          HEADLINE: '${{ steps.compare.outputs.headline }}'
+          DETAIL: '${{ steps.compare.outputs.detail }}'
+          PINNED: '${{ steps.compare.outputs.pinned }}'
+          DRY_RUN: '${{ inputs.dry_run }}'
+          TEST_NOTIFY: '${{ inputs.test_notification }}'
+          JOB_STATUS: '${{ job.status }}'
+          OUTCOME: '${{ steps.raise.outputs.outcome }}'
+          PR_NUMBER: '${{ steps.raise.outputs.pr_number }}'
+          PR_URL: '${{ steps.raise.outputs.pr_url }}'
+          BASE_PINNED: '${{ steps.raise.outputs.pinned }}'
+        run: |
+          set -euo pipefail
+          notify="${NOTIFY}"
+          headline="${HEADLINE}"
+          detail="${DETAIL}"
+          # The raise step reads the pin on the default branch, which a
+          # dispatch from another ref may not match; report that one.
+          pinned="${BASE_PINNED:-${PINNED}}"
+          link="<${PR_URL}|#${PR_NUMBER}>"
+          case "${OUTCOME}" in
+            raised|updated|open)
+              notify=true
+              headline='🔔 1Password CLI update available' ;;
+            none|deferred)
+              # Nothing to bump, or the write waits for the next run
+              if [ "${TEST_NOTIFY:-false}" != 'true' ]; then
+                notify=false
+              fi ;;
+          esac
+          case "${OUTCOME}" in
+            raised)
+              detail="Raised ${link} to bump \`action.yaml\`." ;;
+            updated)
+              detail="Updated ${link} to bump \`action.yaml\`." ;;
+            open)
+              detail="${link} already proposes this bump; review it." ;;
+            retired)
+              notify=true
+              headline='🧹 1Password CLI bump proposal retired'
+              detail="\`action.yaml\` already pins \`${BASE_PINNED}\`;"
+              detail="${detail} closed ${link}." ;;
+          esac
+          if [ "${JOB_STATUS}" = 'failure' ] && [ -z "${OUTCOME}" ]; then
+            detail='Raising the pull request failed; see the workflow run.'
+            detail="${detail} Bump the \`version:\` input in \`action.yaml\`."
+          fi
+          # A dry run posts nothing, even with a test message requested
+          if [ "${DRY_RUN:-false}" = 'true' ]; then
+            notify=false
+          fi
+          {
+            echo "notify=${notify}"
+            echo "headline=${headline}"
+            echo "detail=${detail}"
+            echo "pinned=${pinned}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: 'Check Slack configuration'
         id: check-slack-config
-        if: steps.compare.outputs.notify == 'true'
+        if: ${{ !cancelled() && steps.compose.outputs.notify == 'true' }}
         shell: bash
         env:
           SLACK_BOT_TOKEN: '${{ secrets.SLACK_BOT_TOKEN }}'
@@ -178,9 +693,10 @@ jobs:
 
       - name: 'Send Slack update reminder'
         if: >-
-          steps.compare.outputs.notify == 'true'
+          ${{ !cancelled()
+          && steps.compose.outputs.notify == 'true'
           && steps.check-slack-config.outputs.configured == 'true'
-          && vars.SLACK_CHANNEL_ID != ''
+          && vars.SLACK_CHANNEL_ID != '' }}
         # yamllint disable-line rule:line-length
         uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
         with:
@@ -189,12 +705,12 @@ jobs:
           # yamllint disable rule:line-length
           payload: |
             channel: "${{ vars.SLACK_CHANNEL_ID }}"
-            text: "${{ steps.compare.outputs.headline }} — ${{ github.repository }}"
+            text: "${{ steps.compose.outputs.headline }} — ${{ github.repository }}"
             blocks:
               - type: "header"
                 text:
                   type: "plain_text"
-                  text: "${{ steps.compare.outputs.headline }}"
+                  text: "${{ steps.compose.outputs.headline }}"
               - type: "section"
                 text:
                   type: "mrkdwn"
@@ -202,13 +718,13 @@ jobs:
               - type: "section"
                 fields:
                   - type: "mrkdwn"
-                    text: "*Pinned:* `${{ steps.compare.outputs.pinned }}`"
+                    text: "*Pinned:* `${{ steps.compose.outputs.pinned }}`"
                   - type: "mrkdwn"
                     text: "*Latest stable:* `${{ steps.compare.outputs.latest }}`"
               - type: "section"
                 text:
                   type: "mrkdwn"
-                  text: "${{ steps.compare.outputs.detail }}"
+                  text: "${{ steps.compose.outputs.detail }}"
               - type: "context"
                 elements:
                   - type: "mrkdwn"
